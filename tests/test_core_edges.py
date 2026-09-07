@@ -1513,6 +1513,9 @@ class TestMountVolume:
             seen["volname"] = kwargs.get("volname")
 
         monkeypatch.setattr(fusepy, "FUSE", _fake_fuse)
+        # volname is a macFUSE option, set only on darwin; force it so the
+        # naming assertion holds on the Linux CI runner too.
+        monkeypatch.setattr(fo.sys, "platform", "darwin")
         mp = str(tmp_path / "mnt")
         obj = fo.mount_volume(path, key, mp, foreground=True)
         assert isinstance(obj, QuantaCryptFUSE)

@@ -1552,6 +1552,9 @@ class TestMountPointCheck:
             exc.opts = kw
             raise exc
         monkeypatch.setattr(fuse, "FUSE", _stub)
+        # These tests assert the macOS mount behaviour (volname is a macFUSE
+        # option set only on darwin); force it so they hold on Linux CI.
+        monkeypatch.setattr(fo.sys, "platform", "darwin")
 
     def test_finder_litter_does_not_make_the_mount_point_non_empty(self, tmp_path, stub_fuse):
         path, key, vc = _make_volume(tmp_path, "My Vault.qcv")
