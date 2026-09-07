@@ -33,7 +33,7 @@ python -m quantacrypt
 
 > `tkinterdnd2` is optional — enables drag-and-drop. Everything works without it.
 > `zxcvbn` is optional — enables the password strength estimator. A built-in fallback is used without it.
-> `fusepy` is optional — enables encrypted volume mounting. Install with `pip install fusepy` plus a FUSE backend (macOS: `brew install --cask macfuse`).
+> `fusepy` is optional — enables encrypted volume mounting. Install with `pip install fusepy` plus a FUSE backend (macOS: `brew install --cask fuse-t`, the kext-free option both UIs recommend; `macfuse` also works).
 
 ---
 
@@ -52,7 +52,7 @@ python -m quantacrypt
 
 **Split-key mode** works like a vault with multiple keys: you give each person a unique share, and only when enough people combine their shares can the file be unlocked. Quick presets (2-of-3, 3-of-5, 3-of-7) make configuration easy.
 
-> **Note on folder encryption:** a folder is archived straight into the encrypted output. No plaintext copy of it is written anywhere, not even briefly, so a synced or removable destination never sees your files, and the only extra disk space needed is the output itself. Members that are already compressed (photos, video, archives) are stored as-is inside the archive rather than deflated again; text and documents are deflated.
+> **Note on folder encryption:** a folder is archived straight into the encrypted output. No plaintext copy of it is written anywhere, not even briefly, so a synced or removable destination never sees your files, and the only extra disk space needed is the output itself. Members that are already compressed (photos, video, archives) are stored as-is inside the archive rather than deflated again; text and documents are deflated. Symbolic links inside the folder are not packed (a link would point outside the archive); the result screen names the ones that were left out.
 
 ---
 
@@ -164,6 +164,9 @@ On success it produces two artifacts in `dist/`:
 
 ```bash
 python -m pytest tests/ -v
+
+# One file without the coverage gate (the whole-package fail_under would fail a passing subset)
+python -m pytest --no-cov tests/test_crypto.py
 ```
 
 Coverage reports are generated automatically: a summary prints to the terminal and a detailed HTML report is written to `htmlcov/`.
@@ -184,6 +187,11 @@ bundled helper (`qc-core`). `python scripts/build.py --native` produces one
 replacement for the Tkinter windows; see `docs/design/native-macos-ui.md`
 for the plan and `RELEASING.md` for the build. The Tkinter app remains the shipped UI
 until the native one reaches parity.
+
+The native shell is also the accessible one: its controls are real AppKit
+controls with VoiceOver labels. Tk on macOS exposes no accessibility role for
+the label-based buttons the Tkinter windows use, so screen-reader users should
+prefer the native app.
 
 ---
 
@@ -221,9 +229,9 @@ Files are written as format version 2 (`FORMAT_VERSION` in `core/crypto.py`). Fo
 
 ## .qcv Volume Format
 
-Encrypted virtual drives that mount as real volumes via FUSE. Each file inside the volume is independently encrypted (Cryptomator-style architecture).
+Encrypted virtual drives that mount as real volumes via FUSE. Each file inside the volume is independently encrypted (Cryptomator-style architecture). A volume whose file or folder can't be written (a read-only disk image, a locked share) mounts read-only and says so, rather than failing on the first copy. Keep sync clients away from a mounted vault: if the container file is replaced, overwritten in place, shortened, renamed or removed beneath the mount (a version restored by iCloud Drive or Dropbox, a backup copied over it), the drive flips read-only and keeps serving what it opened instead of writing into the foreign file, and any writes made since the change are copied to a `.stale-` file beside the vault. One FUSE-specific limit to know: a folder holding a file another app still has open can't be removed until that file is closed (`rm -rf` reports "Directory not empty"); see `docs/design/encrypted-volumes.md`.
 
-Containers are format version 3 (`VOLUME_FORMAT_VERSION` in `core/volume.py`): the layout of version 2 plus a cleartext auth-params block that names its key encapsulation (`kem`) and, for password volumes, its Argon2id parameters (`argon2`). Version 1 containers still open and are rewritten as version 2 on their first save. Version 2 containers (Kyber-768, implicit parameters) open unchanged and keep their version through every compaction, so an older release can still mount them. Everything the app tells you about a volume before you unlock it comes from the cleartext block; on unlock that block is compared with the sealed copy inside the encrypted metadata, so an edited block is reported as tampering rather than as a wrong password.
+Containers are format version 3 (`VOLUME_FORMAT_VERSION` in `core/volume.py`): the layout of version 2 plus a cleartext auth-params block that names its key encapsulation (`kem`) and, for password volumes, its Argon2id parameters (`argon2`). Version 1 containers still open and are rewritten as version 2 on their first save. Version 2 containers (Kyber-768, implicit parameters) open unchanged and keep their version through every compaction, so an older release can still mount them. Everything the app tells you about a volume before you unlock it comes from the cleartext block. The key is derived from that block, so an edited salt or parameter set fails at the credential step; because the KEM private key is sealed under the password (or shares), a failure *after* it unseals — the KEM ciphertext, the sealed metadata, the metadata HMAC, a header version that disagrees with the sealed one, or a field edited or removed in the cleartext block — is reported as tampering, never as a wrong password. Only a wrong password or share set produces the wrong-credentials message.
 
 ```
 [ 512-byte header: magic + version + volume UUID + nonces                ]

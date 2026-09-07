@@ -69,45 +69,53 @@ class LauncherApp(tk.Toplevel):
             except Exception:
                 pass
 
-    def _quit_app(self):
-        """Quit, unmounting any live volumes first.
-
-        Bare destroy() with volumes mounted loses in-flight kernel writes
-        and leaves the mountpoint dangling in Finder — atexit only saves
-        buffered volume state, it does not unmount.
-        """
+    def can_quit(self) -> bool:
+        """Whether the app may quit given what is mounted — a pure predicate
+        (it may still unmount, which is what quitting entails), shared with
+        the Quit Apple event so every window is asked before anything is torn
+        down (review run 20 F-005)."""
         try:
             from quantacrypt.core.fuse_ops import (
                 get_mounted_volumes, unmount_volume)
             mounted = list(get_mounted_volumes())
         except Exception:
             mounted = []
-        if mounted:
-            from tkinter import messagebox
-            n = len(mounted)
-            noun = "volume" if n == 1 else f"{n} volumes"
-            if not messagebox.askyesno(
-                    "Volumes mounted",
-                    f"You still have {noun} mounted:\n"
-                    + "\n".join(f"  • {mp}" for mp in mounted[:5])
-                    + ("\n  …" if n > 5 else "")
-                    + "\n\nUnmount and quit?",
-                    icon="warning", default="yes", parent=self):
-                return
-            failed = []
-            for mp in mounted:
-                try:
-                    unmount_volume(mp)
-                except Exception as exc:
-                    failed.append(f"{mp}: {exc}")
-            if failed:
-                messagebox.showerror(
-                    "Unmount failed",
-                    "Some volumes could not be unmounted (files may be "
-                    "in use):\n\n" + "\n".join(failed)
-                    + "\n\nClose the files using them, then quit again.",
-                    parent=self)
-                return
+        if not mounted:
+            return True
+        from tkinter import messagebox
+        n = len(mounted)
+        noun = "volume" if n == 1 else f"{n} volumes"
+        if not messagebox.askyesno(
+                "Volumes mounted",
+                f"You still have {noun} mounted:\n"
+                + "\n".join(f"  • {mp}" for mp in mounted[:5])
+                + ("\n  …" if n > 5 else "")
+                + "\n\nUnmount and quit?",
+                icon="warning", default="yes", parent=self):
+            return False
+        failed = []
+        for mp in mounted:
+            try:
+                unmount_volume(mp)
+            except Exception as exc:
+                failed.append(f"{mp}: {exc}")
+        if failed:
+            messagebox.showerror(
+                "Unmount failed",
+                "Some volumes could not be unmounted (files may be "
+                "in use):\n\n" + "\n".join(failed)
+                + "\n\nClose the files using them, then quit again.",
+                parent=self)
+            return False
+        return True
+
+    def _quit_app(self):
+        """Quit, unmounting any live volumes first (the launcher's own ⌘Q /
+        close button; the Apple-event hook drives ``can_quit`` directly)."""
+        if not self.can_quit():
+            return
+        from quantacrypt.ui.shared import ClipboardTimer
+        ClipboardTimer.wipe_all()
         self.master.destroy()
 
     def _on_drop(self, event):
@@ -289,7 +297,12 @@ class LauncherApp(tk.Toplevel):
         tk.Label(hdr, text="RECENTLY DECRYPTED", font=F["small"],
                  bg=C["bg"], fg=C["text3"]).pack(side="left")
         def _do_clear():
-            RecentFiles.clear()
+            if not RecentFiles.clear():
+                from quantacrypt.ui.shared import alert
+                alert(self, "Couldn't clear the list",
+                      "The recent-files list could not be rewritten, so it is "
+                      "still stored. Check that your home folder is writable.")
+                return
             self._build_recent()
         FlatButton(hdr, "Clear", _do_clear, primary=False, small=True).pack(side="right")
         for path, entry in entries[:_RECENT_VISIBLE]:

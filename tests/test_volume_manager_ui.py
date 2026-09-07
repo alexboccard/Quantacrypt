@@ -2408,7 +2408,7 @@ class TestMountedList:
         vc.save()
         app = env.make()
         text = app._stats_text({"volume": vc})
-        assert text.startswith("1 file  ·  1 folder  ·  1,000 B  ·  file on disk ")
+        assert text.startswith("1 file  ·  1 folder  ·  1.0 KB  ·  file on disk ")
 
         vc.write_file("/b.txt", b"y" * 24)
         assert app._stats_text({"volume": vc}).startswith("2 files  ·  1 folder  ·  ")

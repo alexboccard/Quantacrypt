@@ -27,7 +27,7 @@ process-level API that streams progress and supports cancellation.
 
 Executable: `qc-core` (entry point `quantacrypt.cli:main`), also
 `python -m quantacrypt.cli`. One request per line on stdin, one JSON object
-per line on stdout, nothing else on stdout (logs go to stderr).
+per line on stdout, nothing else on stdout (logs go to stderr). Stderr has a privacy contract with the shell: a line is made public in the unified log only when it starts with `qc-core ERROR `, `qc-core CRITICAL `, `qc-core: ` or `Traceback`; every other line is private. The helper therefore keeps ERROR-level text path-free (errno and strerror, the exception type) and puts container paths, mount points and tracebacks on INFO records; a multi-line record carries its level prefix on every line, so a traceback logged at INFO stays private line by line (review run 18).
 
 ### Request
 
@@ -69,12 +69,15 @@ reports one, else `null`.
 | `fuse_check` | — | `{fuse_backend: {ok, detail}, fusepy: {ok, detail}, ok}` |
 | `inspect` | `path` (.qcx) | `{path, size, version, mode, threshold, total, embedded, argon2}` |
 | `volume_inspect` | `path` (.qcv) | `{path, size, format_version, mode, threshold, total}` |
-| `encrypt` | `source` (file or folder), `output`, `mode` (`password`\|`shamir`), `password`, `k`, `n`, `embed_binary` (optional path prepended for self-executing files) | `{output, size, filename, mode, threshold, total, shares: [{index, code, mnemonic}]}` |
-| `decrypt` | `path`, `output_dir`, `password` or `shares` (codes or 50-word mnemonics), `verify_only` | `{verified}` or `{output, filename, size, original_size, timestamp, renamed}` |
+| `encrypt` | `source` (file or folder), `output`, `mode` (`password`\|`shamir`), `password`, `k`, `n`, `embed_binary` (optional path prepended for self-executing files) | `{output, size, filename, mode, threshold, total, shares: [{index, code, mnemonic}], skipped_symlinks: [paths]}` — a folder's symlinks are left out of the archive (zipfile would store the target's bytes) and listed so the UI can name them |
+| `decrypt` | `path`, `output_dir`, `password` or `shares` (codes or 50-word mnemonics), `verify_only` | `{verified, mode}` or `{output, filename, size, original_size, timestamp, renamed}` |
 | `volume_create` | `path`, `mode`, `password` or `k`,`n` | `{path, mode, shares}` |
-| `volume_mount` | `path`, `mount_point`, `password` or `shares` | `{mount_point, volume_path, journal_suspicious}` |
-| `volume_unmount` | `mount_point` | `{mount_point}` |
-| `volume_list` | — | `{volumes: [{mount_point, volume_path, stats: {file_count, dir_count, total_plaintext_size, container_size, ...} \| null}]}` |
+| `volume_mount` | `path`, `mount_point`, `password` or `shares` | `{mount_point, volume_path, journal_suspicious, suspect_sidecar, read_only}` — when the journal tail failed to verify, `journal_suspicious` is true and `suspect_sidecar` is the `<vault>.qcv.suspect-<stamp>` file it was copied to beside the volume (else `null`); a UI names that file in its alert, or the one artefact an investigation could use reads as litter. `read_only` is true when the container or its directory refuses writes and the drive was served `-o ro` instead of failing on the first save; a client treats it as false when absent (older helpers). `mount_point` is echoed as the helper tracks it: a leading `~` is expanded, and that is the value `volume_list` lists and `volume_unmount` takes |
+| `volume_unmount` | `mount_point` | `{mount_point}` — `~` is expanded, so the value `volume_mount` echoed and the one the client sent both work |
+
+Every path parameter (`path`, `source`, `output`, `output_dir`, `embed_binary`, `mount_point`) has a leading `~` expanded by the helper.
+
+| `volume_list` | — | `{volumes: [{mount_point, volume_path, read_only, stats: {file_count, dir_count, total_plaintext_size, container_size, ...} \| null}]}` — `read_only` mirrors the mount result's flag so a client that rebuilds its list from this poll keeps it |
 | `cancel` | `target` (request id) | `{cancelled: bool}` |
 | `shutdown` | — | cancels in-flight work, unmounts every volume, THEN answers `{unmount_failed: [mount points]}` and exits |
 
@@ -104,19 +107,26 @@ live in the parent's memory. The service never logs params.
 - `shutdown` → cancel in-flight requests, join workers, unmount volumes,
   answer `done` with any `unmount_failed` mount points, exit. The
   acknowledgement comes *after* the work so a client can start its escalation
-  timer on it.
+  timer on it. That work is bounded per volume, not per request — a 5 s
+  worker join plus up to 30 s for each `diskutil unmount` that waits on an
+  open file — so a client's deadline for the answer must scale with the
+  mounted count (the SwiftUI shell waits 10 + 35 × max(1, n) s) before it
+  escalates to SIGTERM; a flat deadline abandons the remaining volumes.
 - SIGTERM → the handler flags the loop, cancels workers and raises out of
   the blocked stdin read; teardown then runs in `run()`'s `finally` on the
   main thread outside the signal handler (which may be holding the mount
   lock), so the process never deadlocks on itself.
 - One writer lock serialises stdout; events from different requests
   interleave line-by-line.
-- Output files are written to `<output>.tmp` and `os.replace`d; decrypt
-  writes to a `mkstemp` file in the output directory and renames to the
-  original filename (with `_2` suffixing on collision, reported as `renamed`).
-- Folder sources are zipped to a `0600` staging file in the output directory
-  (same reasoning as the Tk encryptor: never `$TMPDIR`), encrypted as
-  `<folder>.zip`, and the staging file is always removed.
+- Output files are written to a `0600` `mkstemp` file beside the output
+  (`.<name>.qc-enc-*`, never `$TMPDIR`) and `os.replace`d; decrypt writes to
+  a `mkstemp` file in the output directory and renames to the original
+  filename (with `_2` suffixing on collision, reported as `renamed`).
+- Folder sources are streamed: the zip archive is written straight into the
+  cipher through that same temp file, so no plaintext staging file ever
+  touches the disk and the transient space needed is the ciphertext alone.
+  The result is named `<folder>.zip`; symlinks inside the folder are skipped
+  and reported in `skipped_symlinks`.
 
 ## What moved into `core/`
 

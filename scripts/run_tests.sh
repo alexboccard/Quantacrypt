@@ -81,7 +81,7 @@ while IFS= read -r line; do
 done < <(
   "$PY" -m pytest tests/ -q -o addopts="" -p no:cacheprovider --no-header \
     -m gui --collect-only 2>/dev/null \
-    | grep -oE '^tests/[a-z_]+\.py' | sort -u
+    | grep -oE '^tests/[A-Za-z0-9_]+\.py' | sort -u
 )
 if [ "${#GUI_FILES[@]}" -eq 0 ]; then
   echo "no GUI tests collected — is the 'gui' marker still applied in conftest?" >&2

@@ -2,6 +2,16 @@
   "event": "done",
   "id": "vl",
   "result": {
-    "volumes": []
+    "volumes": [
+      {
+        "mount_point": "/fixture/mnt",
+        "read_only": false,
+        "stats": {
+          "container_size": 4096,
+          "file_count": 1
+        },
+        "volume_path": "/fixture/v.qcv"
+      }
+    ]
   }
 }

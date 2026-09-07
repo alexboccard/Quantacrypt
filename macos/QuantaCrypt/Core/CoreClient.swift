@@ -39,17 +39,33 @@ actor CoreClient {
     /// event before being failed locally.
     private let cancelGrace: Duration
 
+    /// A fixed deadline for `shutdown`, for tests. Nil — the production
+    /// client — derives one per call from the mounted count, see
+    /// `shutdownTimeout(mountedVolumes:)`.
+    private let fixedShutdownTimeout: Duration?
+
+    init(transportFactory: @escaping TransportFactory, cancelGrace: Duration = .seconds(5),
+         shutdownTimeout: Duration? = nil) {
+        self.makeTransport = transportFactory
+        self.cancelGrace = cancelGrace
+        self.fixedShutdownTimeout = shutdownTimeout
+        self.idPrefix = String(UInt32.random(in: 0...UInt32.max), radix: 36)
+    }
+
     /// How long `shutdown` waits for the helper's `done`. The helper cancels
     /// in-flight work and unmounts every volume *before* answering, so this
     /// has to cover that work; the EOF grace only starts once it arrives.
-    private let shutdownTimeout: Duration
+    /// Its worst case is the 5 s worker join plus one 30 s `diskutil
+    /// unmount` per mounted volume (a file held open elsewhere makes each
+    /// one wait). A flat 30 s used to SIGTERM it mid-loop with two volumes
+    /// up: the rest were never saved through `unmount_volume`, and the
+    /// `unmount_failed` report was never sent.
+    static func shutdownTimeout(mountedVolumes: Int) -> Duration {
+        .seconds(10 + 35 * max(1, mountedVolumes))
+    }
 
-    init(transportFactory: @escaping TransportFactory, cancelGrace: Duration = .seconds(5),
-         shutdownTimeout: Duration = .seconds(30)) {
-        self.makeTransport = transportFactory
-        self.cancelGrace = cancelGrace
-        self.shutdownTimeout = shutdownTimeout
-        self.idPrefix = String(UInt32.random(in: 0...UInt32.max), radix: 36)
+    private func shutdownDeadline(mountedVolumes: Int) -> Duration {
+        fixedShutdownTimeout ?? Self.shutdownTimeout(mountedVolumes: mountedVolumes)
     }
 
     /// Production client: resolves the helper on each launch so a Settings
@@ -184,16 +200,18 @@ actor CoreClient {
 
     /// Graceful stop: `shutdown` (the helper cancels work and unmounts every
     /// volume, then answers), EOF, then escalate if it hangs. Safe to call
-    /// twice.
+    /// twice. `mountedVolumes` is the caller's count of what the helper has
+    /// to unmount; it only sizes the wait, so an overestimate is the safe
+    /// side.
     @discardableResult
-    func shutdown() async -> ShutdownOutcome {
+    func shutdown(mountedVolumes: Int = 0) async -> ShutdownOutcome {
         shuttingDown = true
         guard let transport else { return ShutdownOutcome() }
         let gen = generation
         var outcome = ShutdownOutcome()
         var answered = false
         do {
-            let result = try await withTimeout(shutdownTimeout) {
+            let result = try await withTimeout(shutdownDeadline(mountedVolumes: mountedVolumes)) {
                 try await self.perform(.shutdown)
             }
             answered = true
@@ -203,10 +221,10 @@ actor CoreClient {
         } catch {
             Logger.client.warning("shutdown request failed: \(error.localizedDescription, privacy: .public)")
         }
-        // A helper that did not answer `shutdown` inside 30 s is wedged, and
-        // waiting the full EOF grace on top of that is what made quit read as
-        // a hang: go to SIGTERM sooner. The grace is for the helper that did
-        // answer and is finishing its last write.
+        // A helper that did not answer `shutdown` inside its deadline is
+        // wedged, and waiting the full EOF grace on top of that is what made
+        // quit read as a hang: go to SIGTERM sooner. The grace is for the
+        // helper that did answer and is finishing its last write.
         await transport.terminate(timeout: answered ? .seconds(10) : .seconds(1))
         if generation == gen { transportEnded(generation: gen) }
         return outcome
@@ -214,23 +232,23 @@ actor CoreClient {
 
     /// Stop the current helper (if any) and launch a fresh one, e.g. after the
     /// helper path changed in Settings. Pending requests fail with `.helperExited`.
-    func restart() async {
+    func restart(mountedVolumes: Int = 0) async {
         // A second caller joins the restart in progress rather than
         // stopping the helper the first one is about to launch.
         if let restarting {
             await restarting.value
             return
         }
-        let task = Task { await performRestart() }
+        let task = Task { await performRestart(mountedVolumes: mountedVolumes) }
         restarting = task
         await task.value
         restarting = nil
     }
 
-    private func performRestart() async {
+    private func performRestart(mountedVolumes: Int) async {
         if let transport {
             let gen = generation
-            try? await withTimeout(shutdownTimeout) {
+            try? await withTimeout(shutdownDeadline(mountedVolumes: mountedVolumes)) {
                 _ = try await self.perform(.shutdown)
             }
             await transport.terminate(timeout: .seconds(5))

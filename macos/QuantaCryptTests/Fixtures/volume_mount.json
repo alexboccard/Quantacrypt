@@ -4,6 +4,7 @@
   "result": {
     "journal_suspicious": false,
     "mount_point": "/fixture/mnt",
+    "read_only": false,
     "suspect_sidecar": null,
     "volume_path": "/fixture/v.qcv"
   }

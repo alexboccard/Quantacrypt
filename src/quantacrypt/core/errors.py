@@ -8,6 +8,7 @@ vocabulary.  ``friendly_error`` returns the sentence a person should read;
 from __future__ import annotations
 
 import errno as _errno
+import os
 
 
 class InvalidRequest(ValueError):
@@ -62,6 +63,11 @@ def friendly_error(exc: BaseException) -> str:
     if "invalidtag" in lower or "authentication" in lower:
         return ("The password or shares are incorrect, or the file has been "
                 "modified since it was encrypted.")
+    # Before the version branches: every writer stores the HMAC, so a
+    # message about it is about integrity even if it also mentions versions.
+    if "hmac" in lower:
+        return ("The file's integrity check failed. It may be "
+                "corrupt or tampered with.")
     if "unsupported" in lower and "version" in lower:
         return ("This file was created with a newer version of QuantaCrypt. "
                 "Please update the app.")
@@ -71,12 +77,24 @@ def friendly_error(exc: BaseException) -> str:
     if "truncat" in lower or "appears truncated" in lower:
         return ("The file appears to be truncated or incomplete. "
                 "Re-download or restore from backup.")
-    if "hmac" in lower:
-        return ("The file's integrity check failed. It may be "
-                "corrupt or tampered with.")
     if not msg:
         return f"{type(exc).__name__} (no additional detail)"
     return msg
+
+
+def safe_reason(exc: BaseException) -> str:
+    """One line for a log record that may be published, naming no path.
+
+    The Swift shell makes the helper's ERROR-level stderr public in the
+    unified log, and ``str(OSError)`` carries ``filename`` — the container
+    or the mount point.  An ERROR line therefore quotes errno and strerror
+    only; the path belongs on a paired INFO line, which stays private.
+    """
+    if isinstance(exc, OSError) and exc.errno is not None:
+        # The canonical text for the errno, never the exception's own
+        # strerror: volume.py builds OSErrors whose message names a vpath.
+        return f"{type(exc).__name__}: [Errno {exc.errno}] {os.strerror(exc.errno)}"
+    return type(exc).__name__
 
 
 def classify_error(exc: BaseException) -> tuple[str, str, str]:
@@ -114,6 +132,8 @@ def classify_error(exc: BaseException) -> tuple[str, str, str]:
     if ("already mounted" in lower or "in use" in lower or "busy" in lower
             or "another process" in lower):
         return "busy", message, detail
+    if "hmac" in lower:
+        return "format", message, detail
     if "version" in lower and ("newer" in lower or "older" in lower or "unsupported" in lower):
         return "unsupported", message, detail
     if isinstance(exc, ValueError):

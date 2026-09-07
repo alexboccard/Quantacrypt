@@ -358,12 +358,25 @@ class EncryptorApp(tk.Toplevel):
         if self._busy:
             self._request_cancel()
             return
-        if self._has_unsaved_input():
-            if not confirm(self, "Discard this form?",
-                           "The file, password and output you've entered here will be lost.",
-                           yes="Discard", no="Keep editing", danger=True):
-                return
+        if not self._confirm_discard_form():
+            return
         self._close()
+
+    def _confirm_discard_form(self) -> bool:
+        return not self._has_unsaved_input() or confirm(
+            self, "Discard this form?",
+            "The file, password and output you've entered here will be lost.",
+            yes="Discard", no="Keep editing", danger=True)
+
+    def can_quit(self) -> bool:
+        """The Quit Apple event's guard (``__main__._register_quit``): the
+        same refusals the close button makes, without destroying anything.
+        The half-typed-form prompt lives on Escape only, so ⌘Q matches the
+        close button rather than asking where it would not (run 20 F-012)."""
+        if self._busy:
+            self._flash_status("Encryption in progress. Please wait until it finishes", 3000)
+            return False
+        return self._check_shares_saved()
 
     def _close(self):
         if self._busy:
@@ -391,7 +404,9 @@ class EncryptorApp(tk.Toplevel):
     def _on_drop(self, event):
         """Handle drag-and-drop: one folder → folder mode, one file → file
         mode, several files (or any drop while in batch mode) → batch."""
-        if self._busy: return
+        if self._busy:
+            self._flash_status("Encryption in progress. Please wait until it finishes", 3000)
+            return
         try:
             paths = [p for p in self.tk.splitlist(event.data) if p]
         except Exception:
@@ -407,6 +422,8 @@ class EncryptorApp(tk.Toplevel):
             self._build_batch_ui()
             self._refresh_step()
         elif dirs:
+            if len(dirs) > 1:
+                self._flash_status(f"One folder at a time — using {os.path.basename(dirs[0].rstrip('/'))}", 3000)
             # Auto-switch toggle to folder mode and load
             self._src_type.set("folder")
             self._on_folder(dirs[0])
@@ -1014,6 +1031,16 @@ class EncryptorApp(tk.Toplevel):
 
     _KN_ERR = "Enter a number between 2 and 20 for both fields"
 
+    def _kn(self):
+        """(n, k) from the split fields, or None when either is not a number:
+        an emptied Entry makes IntVar.get() raise, and a raise past the
+        point where the form is frozen leaves the window busy with no way
+        to close it (run 18 F-204)."""
+        try:
+            return int(self._n.get()), int(self._k.get())
+        except (tk.TclError, ValueError):
+            return None
+
     def _validate_secret(self):
         """Shared secret checks for single and batch validation."""
         if self._mode.get() == "single":
@@ -1113,10 +1140,10 @@ class EncryptorApp(tk.Toplevel):
                 return "Output path is the same as the input. Choose a different location"
         except OSError: pass
         if self._is_folder:
-            # The plaintext staging zip is created in the output directory;
-            # placing the output inside the source tree would zip staging
-            # artifacts into themselves (see _zip_folder) and bloat the
-            # archive with its own output.
+            # The folder is streamed straight into the cipher, but the output
+            # file itself grows in the output directory while the walk runs;
+            # placing it inside the source tree would archive the growing
+            # output into itself.
             src_abs = os.path.abspath(self._path)
             out_abs = os.path.abspath(out)
             if out_abs == src_abs or out_abs.startswith(src_abs + os.sep):
@@ -1186,6 +1213,9 @@ class EncryptorApp(tk.Toplevel):
                            f"{os.path.basename(out)} already exists. Overwrite it?",
                            yes="Overwrite", no="Cancel", danger=True):
                 return
+        # Everything Tk-side is read before the form freezes: nothing after
+        # this line may raise (see _kn).
+        n, k = self._kn() or (0, 0)
         self._set_status(""); self._busy=True
         self._cancel_event.clear()
         self._new_prog(self._stages_for(is_folder=self._is_folder, mode=self._mode.get()))
@@ -1196,15 +1226,15 @@ class EncryptorApp(tk.Toplevel):
         for w in self._results.winfo_children(): w.destroy()
         # Capture all Tk widget state on the main thread before spawning worker
         # Freeze k/n for every later share-artifact path (see __init__).
-        self._result_k = self._k.get()
-        self._result_n = self._n.get()
+        self._result_k = k
+        self._result_n = n
         params = {
             "path":      self._path,
             "out":       out,
             "mode":      self._mode.get(),
             "pw":        self._pw1v.get(),
-            "n":         self._n.get(),
-            "k":         self._k.get(),
+            "n":         n,
+            "k":         k,
             "embed":     self._embed_dec.get(),
             "is_folder": self._is_folder,
         }
@@ -1275,6 +1305,7 @@ class EncryptorApp(tk.Toplevel):
                            f"These files already exist and will be overwritten:\n{names}",
                            yes="Overwrite", no="Cancel", danger=True):
                 return
+        n, k = self._kn() or (0, 0)            # before the freeze — see _kn
         self._set_status(""); self._busy = True
         self._cancel_event.clear()
         # One bar for the whole batch; per-file stages feed the inner
@@ -1286,16 +1317,16 @@ class EncryptorApp(tk.Toplevel):
         self._prog.start(); self._freeze(); self._wiz.set_step(4)
         self.after(50, lambda: self._cv.yview_moveto(1.0))
         for w in self._results.winfo_children(): w.destroy()
-        self._result_k = self._k.get()
-        self._result_n = self._n.get()
+        self._result_k = k
+        self._result_n = n
         batch_params = {
             "paths":   list(self._batch_paths),
             "outs":    batch_outs,
             "out_dir": out_dir,
             "mode":    self._mode.get(),
             "pw":      self._pw1v.get(),
-            "n":       self._n.get(),
-            "k":       self._k.get(),
+            "n":       n,
+            "k":       k,
             "embed":   self._embed_dec.get(),
         }
         threading.Thread(target=self._run_batch, args=(batch_params,), daemon=True).start()
@@ -1488,9 +1519,10 @@ class EncryptorApp(tk.Toplevel):
 
     def _run(self, p):
         """Worker thread.  core.package.encrypt_to_qcx does the work —
-        folder staging (0600 zip beside the output), the optional embedded
-        decryptor, streaming AES-GCM, the MAGIC tail and the atomic
-        rename — so the Tk wizard and qc-core write byte-identical files."""
+        streaming a folder straight into the cipher (no plaintext staging
+        file), the optional embedded decryptor, streaming AES-GCM, the MAGIC
+        tail and the atomic rename — so the Tk wizard and qc-core write
+        byte-identical files."""
         out = p["out"]
         try:
             dec = self._find_dec() if p["embed"] else None
@@ -1588,8 +1620,13 @@ class EncryptorApp(tk.Toplevel):
             self.after(50, lambda: self._cv.yview_moveto(1.0))
             self.after(50, lambda: again_btn.focus_set() if again_btn.winfo_exists() else None)
             return
-        self._shares_pending = {"__single__"}   # guard: warn if user navigates away
+        # Guard: warn if the user navigates away.  Keyed by the output this
+        # run wrote — picking another file afterwards changes _path/_out
+        # while these cards stay live, and share files were being named and
+        # fingerprinted from the *new* form (holding the old shares).
+        self._shares_pending = {out}
         self._pending_shares = shares  # keep ref for save dialog
+        orig_name = os.path.basename(self._path or "")
         k = self._result_k or self._k.get()
         n = self._result_n or self._n.get()
         self._shares_warn=tk.Frame(self._results,bg=C["surface"],highlightbackground=C["warning"],highlightthickness=1)
@@ -1603,13 +1640,13 @@ class EncryptorApp(tk.Toplevel):
         btn_grp = tk.Frame(warn, bg=C["surface"]); btn_grp.pack(fill="x", padx=SP["l"], pady=(0,SP["s"]))
         # Primary: save one file per person (new feature)
         save_btn = FlatButton(btn_grp, f"Save individual files {ICON['arrow']}",
-                   lambda: self._save_individual_shares(shares, os.path.basename(self._path or ""),
+                   lambda: self._save_individual_shares(shares, orig_name, qcx_path=out,
                                                         banner_frame=self._shares_warn),
                    primary=True, small=False)
         save_btn.pack(side="left")
         # Secondary: save all shares in one combined file (original behaviour)
         FlatButton(btn_grp, "Save combined file",
-                   lambda: self._save_shares(shares, os.path.basename(self._path or "")),
+                   lambda: self._save_shares(shares, orig_name, qcx_path=out),
                    primary=False, small=False).pack(side="left", padx=(SP["s"],0))
         # Copy all shares to clipboard in one click
         self._copy_all_btn = FlatButton(btn_grp, "Copy all",
@@ -1710,6 +1747,10 @@ class EncryptorApp(tk.Toplevel):
             try: self.after_cancel(self._scroll_job)
             except Exception: pass
             self._scroll_job = None
+        # Remember last-used mode and Shamir config across "Encrypt another";
+        # read before anything is cleared, guarded (see _kn).
+        last_mode = self._mode.get()
+        last_kn = self._kn()
         self._shares_pending=set(); self._pending_shares=[]; self._show_done=False
         self._path=None; self._is_folder=False; self._batch_paths=[]
         self._out.delete(0,"end")
@@ -1717,12 +1758,9 @@ class EncryptorApp(tk.Toplevel):
         self._pw1v.set(""); self._pw2v.set("")
         self._pw1.config(show="•"); self._pw2.config(show="•")
         self._eye1_btn.set_text("Show"); self._eye2_btn.set_text("Show")
-        # Remember last-used mode and Shamir config across "Encrypt another"
-        last_mode = self._mode.get()
-        last_n    = self._n.get()
-        last_k    = self._k.get()
         self._mode.set(last_mode); self._embed_dec.set(False); self._set_status("")
-        self._n.set(last_n); self._k.set(last_k)
+        if last_kn is not None:
+            self._n.set(last_kn[0]); self._k.set(last_kn[1])
         for w in self._results.winfo_children(): w.destroy()
         self._prog.pack_forget()
         if keep_batch:
@@ -1808,14 +1846,13 @@ class EncryptorApp(tk.Toplevel):
         k = self._result_k or self._k.get()
         n = self._result_n or self._n.get()
         stem = os.path.splitext(orig)[0] if orig else "shares"
-        # The pending-guard token must be captured NOW: qcx_path is
-        # reassigned just below for fingerprint purposes, and discarding
-        # the reassigned value would leave the single-file "__single__"
-        # token armed forever.
-        pending_token = qcx_path or "__single__"
         # Compute fingerprint of the .qcx file so recipients can match their share
         if qcx_path is None:
             qcx_path = self._out.get().strip()
+        # The guard is keyed by the output this run wrote (_done) or, for
+        # callers that never named it, the legacy single-file token; clear
+        # both so neither can stay armed forever.
+        pending_tokens = {qcx_path, "__single__"}
         qcx_name = os.path.basename(qcx_path) if qcx_path else ""
         fingerprint = ""
         if qcx_path and os.path.isfile(qcx_path):
@@ -1875,7 +1912,7 @@ class EncryptorApp(tk.Toplevel):
             # file's shares stay pending (the leave-guard dialog still
             # offers "Leave anyway?" as the escape hatch).
             return
-        self._shares_pending.discard(pending_token)
+        self._shares_pending -= pending_tokens
         # Dim ShareCards (single-file mode — they live in self._results directly)
         if banner_frame is getattr(self, "_shares_warn", None):
             try:
@@ -1919,8 +1956,9 @@ class EncryptorApp(tk.Toplevel):
         except Exception:
             pass
 
-    def _save_shares(self,shares,orig):
-        out_dir=os.path.dirname(os.path.abspath(self._out.get().strip())) if self._out.get().strip() else ""
+    def _save_shares(self, shares, orig, qcx_path=None):
+        qcx_path = (qcx_path or self._out.get()).strip()
+        out_dir = os.path.dirname(os.path.abspath(qcx_path)) if qcx_path else ""
         p=filedialog.asksaveasfilename(initialdir=out_dir,
             initialfile=os.path.splitext(orig)[0]+".shares.txt",defaultextension=".txt")
         if not p: return
@@ -1929,7 +1967,6 @@ class EncryptorApp(tk.Toplevel):
         mnemonics = _mnemonics_for(shares, k)
         # Compute a short fingerprint of the .qcx file to help match shares to file later
         qcx_ref = ""
-        qcx_path = self._out.get().strip()
         if qcx_path and os.path.isfile(qcx_path):
             try:
                 import hashlib
@@ -1957,7 +1994,10 @@ class EncryptorApp(tk.Toplevel):
                 "Your shares have NOT been saved. Please try a different location.",
                 parent=self)
             return
-        self._shares_pending.discard("__single__")   # shares are now saved
+        # Shares are now saved: this run's token, or the legacy one when the
+        # caller did not name the output.
+        self._shares_pending.discard(qcx_path or "__single__")
+        self._shares_pending.discard("__single__")
         try:
             for w in self._results.winfo_children():
                 if isinstance(w, ShareCard):

@@ -111,8 +111,9 @@ class TestAttributesPersist:
         fs = QuantaCryptFUSE(vc)
         fs.chmod("/a.txt", 0o100755)
         fs.utimens("/a.txt", (1_000_000, 1_234_567))
-        assert vc.is_dirty, "an attribute change must mark the volume dirty"
-        vc.save()
+        # Run 13 (F-013): attribute ops persist at once like every other
+        # mutation, so nothing is left dirty for a later save to carry.
+        assert not vc.is_dirty
 
         reopened = vol.VolumeContainer(path, key)
         reopened.open()

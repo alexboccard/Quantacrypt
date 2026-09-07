@@ -172,6 +172,31 @@ final class HelperLocatorTests: XCTestCase {
         XCTAssertNil(resolution.refusal, "a signed helper inside the bundle needs no click")
     }
 
+    /// `FileManager.isExecutableFile` is true for any searchable folder, so
+    /// the bundle `build.py --helper` produces — not the Mach-O inside it —
+    /// used to pass, be signature-checked as a bundle, be approvable, and
+    /// then fail opaquely in `Process.run()` (F-027).
+    func testAnOverridePointingAtABundleFolderIsRefusedAndNamesTheExecutable() throws {
+        let bundle = scratch.appending(path: "qc-core.app")
+        try writeBundleSkeleton(at: bundle, identifier: "com.alexboccard.quantacrypt.core", executable: "qc-core")
+        let resolution = resolve(override: bundle.path, approved: { _, _ in true })
+        XCTAssertEqual(resolution.launch?.executable.path, bundledHelper.path,
+                       "a folder cannot be exec'd, approved or not")
+        XCTAssertEqual(resolution.refusal?.path, bundle.standardizedFileURL.path)
+        XCTAssertEqual(resolution.refusal?.approvable, false)
+        XCTAssertTrue(resolution.refusal?.reason.contains("Contents/MacOS/qc-core") == true,
+                      "the sentence should say what the path should have been: \(resolution.refusal?.reason ?? "")")
+    }
+
+    func testAnOverridePointingAtAPlainFolderIsRefused() throws {
+        let folder = scratch.appending(path: "helpers")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let resolution = resolve(override: folder.path, approved: { _, _ in true })
+        XCTAssertEqual(resolution.launch?.origin, "bundle")
+        XCTAssertEqual(resolution.refusal?.approvable, false)
+        XCTAssertTrue(resolution.refusal?.reason.contains("is a folder") == true)
+    }
+
     // MARK: The bundle is not a trust boundary at runtime (S-03)
 
     /// The comment used to say the app's seal made a swapped helper
@@ -180,8 +205,11 @@ final class HelperLocatorTests: XCTestCase {
     /// no button, because nothing could be re-checked before `exec`.
     func testAnUnsignedBundledHelperIsRefused() {
         let resolution = resolve(override: nil, signature: { _ in .unsigned("no signature") })
-        XCTAssertNotEqual(resolution.launch?.origin, "bundle",
-                          "an unmeasurable helper must not receive passwords and shares")
+        // On a developer machine the DEBUG-only venv fallback still resolves
+        // a launch; anything else here would mean the bundled helper leaked
+        // through (review F-210).
+        XCTAssertTrue(resolution.launch == nil || resolution.launch?.origin == "dev venv",
+                      "an unmeasurable helper must not receive passwords and shares")
         XCTAssertNotEqual(resolution.launch?.executable.path, bundledHelper.path)
         XCTAssertEqual(resolution.refusal?.approvable, false)
         XCTAssertTrue(resolution.refusal?.reason.contains("bundled with QuantaCrypt") == true)

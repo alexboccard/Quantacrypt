@@ -35,6 +35,30 @@ final class FixtureDecodingTests: XCTestCase {
         "shutdown": { try $0.decoded(as: [String: JSONValue].self) },
     ]
 
+    /// Wire keys the app reads that a decoder would silently miss if the
+    /// helper renamed them (optional / `decodeIfPresent` fields decode to nil
+    /// and stay green). The fixture must carry each, so a rename on the
+    /// Python side goes red here — `skipped_symlinks` drifted exactly this
+    /// way (review F-202, F-210). The `volume_list` entry keys are checked
+    /// on the first listed volume.
+    private static let requiredKeys: [String: [String]] = [
+        "encrypt": ["output", "size", "filename", "mode", "threshold", "total", "shares", "skipped_symlinks"],
+        "decrypt": ["output", "filename", "size", "original_size", "timestamp", "renamed"],
+        "volume_mount": ["mount_point", "volume_path", "journal_suspicious", "suspect_sidecar", "read_only"],
+        "volume_list": ["volumes"],
+        "volume_list.volumes[0]": ["mount_point", "volume_path", "read_only", "stats"],
+    ]
+
+    private static func keys(of value: JSONValue) -> Set<String> {
+        if case .object(let object) = value { return Set(object.keys) }
+        return []
+    }
+
+    private static func firstVolume(of result: JSONValue) -> JSONValue? {
+        guard case .object(let object) = result, case .array(let volumes)? = object["volumes"] else { return nil }
+        return volumes.first
+    }
+
     /// The committed fixtures, beside this file in the source tree. They are
     /// read from source rather than from the test bundle so a fixture added
     /// without regenerating the Xcode project is still checked.
@@ -63,7 +87,18 @@ final class FixtureDecodingTests: XCTestCase {
             exercised.insert(key)
             let text = try String(contentsOf: file, encoding: .utf8)
             do {
-                _ = try decode(try Self.result(from: text, op: op))
+                let result = try Self.result(from: text, op: op)
+                _ = try decode(result)
+                if let required = Self.requiredKeys[key] {
+                    let missing = required.filter { !Self.keys(of: result).contains($0) }
+                    XCTAssertEqual(missing, [], "\(file.lastPathComponent) no longer carries \(missing)")
+                }
+                if key == "volume_list", let required = Self.requiredKeys["volume_list.volumes[0]"] {
+                    let entry = Self.firstVolume(of: result)
+                    XCTAssertNotNil(entry, "volume_list.json lists no volume — dump it after the faked mount")
+                    let missing = required.filter { !Self.keys(of: entry ?? .null).contains($0) }
+                    XCTAssertEqual(missing, [], "volume_list entry no longer carries \(missing)")
+                }
             } catch {
                 XCTFail("\(file.lastPathComponent) no longer decodes: \(error)")
             }

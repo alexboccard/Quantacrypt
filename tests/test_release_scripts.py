@@ -72,16 +72,20 @@ def test_stamp_preserves_the_comment_and_the_indentation(repo):
     # keep them on purpose.
     assert init == '    __version__ = "2.0.0"  # keep in sync with pyproject.toml\n'
     assert yml.startswith('        CFBundleShortVersionString: "2.0.0"\n')
-    # A neighbouring key with the same shape must not be dragged along.
-    assert 'CFBundleVersion: "1"' in yml
+    # CFBundleVersion is stamped too (run 13 F-005: LaunchServices picks among
+    # duplicate app copies by it), and the two keys must not clobber each
+    # other's rewrite of the same file.
+    assert 'CFBundleVersion: "2.0.0"' in yml
 
 
 def test_stamp_quotes_an_unquoted_yaml_value(repo):
     (repo / "macos" / "project.yml").write_text(
-        "        CFBundleShortVersionString: 1.3.0\n", encoding="utf-8")
+        "        CFBundleShortVersionString: 1.3.0\n"
+        "        CFBundleVersion: 1\n", encoding="utf-8")
     assert stamp_version.stamp(str(repo), "1.4.0") == 0
     assert (repo / "macos" / "project.yml").read_text(encoding="utf-8") == \
-        '        CFBundleShortVersionString: "1.4.0"\n'
+        '        CFBundleShortVersionString: "1.4.0"\n' \
+        '        CFBundleVersion: "1.4.0"\n'
 
 
 def test_a_target_that_no_longer_matches_fails_and_writes_nothing(repo, capsys):
@@ -121,8 +125,31 @@ def test_the_real_checkout_still_matches_every_pattern():
     """Guards the regexes against a reformat of the files they target."""
     edits, problems = stamp_version.plan(ROOT, "0.0.0")
     assert not problems, problems
-    versions = {rel: old for _, rel, old, _ in edits}
-    assert len(set(versions.values())) == 1, versions
+    # Every file must carry what the checkout's release version implies for
+    # it — CFBundleVersion holds the numeric prefix, so a pre-release checkout
+    # legitimately shows two strings (run 15 F-004).
+    release = next(old for _, rel, old, _, _ in edits if rel == "pyproject.toml")
+    assert len(edits) == len(stamp_version.TARGETS)      # plan() keeps TARGETS order
+    for (_, rel, old, _, _), (_, _, _, expected) in zip(edits, stamp_version.TARGETS):
+        assert old == expected(release), (rel, old, release)
+
+
+def test_the_tk_bundle_plist_gets_a_numeric_build_number(tmp_path, monkeypatch):
+    """Run 15: the native app's rule (scripts/stamp_version.py) applied to the
+    Tk bundle's Info.plist too — both DMG kinds must order the same way."""
+    import plistlib
+    spec = importlib.util.spec_from_file_location(
+        "build_script", os.path.join(ROOT, "scripts", "build.py"))
+    build = importlib.util.module_from_spec(spec); spec.loader.exec_module(build)
+    app = tmp_path / "QuantaCrypt.app"; (app / "Contents").mkdir(parents=True)
+    with open(app / "Contents" / "Info.plist", "wb") as f:
+        plistlib.dump({"CFBundleName": "QuantaCrypt"}, f)
+    monkeypatch.setattr(build, "_read_version", lambda: "1.5.0-beta")
+    build._patch_plist(str(app), "icon")
+    with open(app / "Contents" / "Info.plist", "rb") as f:
+        plist = plistlib.load(f)
+    assert plist["CFBundleShortVersionString"] == "1.5.0-beta"
+    assert plist["CFBundleVersion"] == "1.5.0"
 
 
 # ── scripts/build.py: code signing ────────────────────────────────────────

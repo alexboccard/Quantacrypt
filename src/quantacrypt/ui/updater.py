@@ -14,6 +14,7 @@ so the same banner does not come back every launch.
 """
 
 import json
+import re
 import threading
 import tkinter as tk
 import urllib.request
@@ -40,18 +41,46 @@ def _release_page(url) -> str:
     return _RELEASES_URL
 
 
+_NUMERIC_PREFIX = re.compile(r"\s*[vV]?(\d+(?:\.\d+)*)")
+
+
 def _parse_version(tag: str) -> Tuple[int, ...]:
-    """Turn 'v1.2.3' or '1.2.3-beta' into a comparable tuple (1, 2, 3)."""
-    tag = tag.lstrip("vV")
-    # Strip any pre-release suffix (e.g. '-beta', '-rc1')
-    tag = tag.split("-")[0]
-    parts = []
-    for p in tag.split("."):
-        try:
-            parts.append(int(p))
-        except ValueError:
-            break
-    return tuple(parts) or (0,)
+    """Turn 'v1.2.3', '1.2.3-beta' or the PEP 440 '1.2.3b0' into (1, 2, 3).
+
+    Only the leading numeric release matters: a pre-release build compares
+    equal to its tag and older than the final.  Splitting on '-' and
+    stopping at the first non-integer *component* read the stamped
+    '1.5.0b0' as (1, 5), so every stable 1.5.x looked newer — including
+    older ones — and the banner installing could never clear came back.
+    """
+    m = _NUMERIC_PREFIX.match(tag)
+    if not m:
+        return (0,)
+    return tuple(int(p) for p in m.group(1).split("."))
+
+
+def _version_key(tag: str) -> Tuple[Tuple[int, ...], int]:
+    """What check_for_update orders by: the release, then a rank.
+
+    The rank puts a pre-release below its final and a post-release above
+    it, so a `1.5.0b0` build is offered `v1.5.0` — the release its users
+    are waiting for — while `v1.5.0-beta` itself stays "up to date".  Any
+    remainder after the numeric release counts as a pre-release marker
+    (`b0`, `-beta`, `rc1`, `.dev3`) except a PEP 440 local segment (`+ci`)
+    and `post`: enumerating spellings is how the `\b`-terminated form
+    missed the stamped `1.5.0b0`.
+    """
+    m = _NUMERIC_PREFIX.match(tag)
+    if not m:
+        return ((0,), 0)
+    rest = tag[m.end():].strip().lstrip("-._").lower()
+    if not rest or rest.startswith("+"):
+        rank = 0
+    elif rest.startswith("post"):
+        rank = 1
+    else:
+        rank = -1
+    return (_parse_version(tag), rank)
 
 
 def _fetch_latest() -> Optional[dict]:
@@ -78,7 +107,9 @@ def check_for_update(parent: "tk.Toplevel", current_version: str) -> None:
 
     def _worker():
         data = _fetch_latest()
-        if not data:
+        # A JSON array, or a captive-portal page that happens to parse,
+        # would raise in the daemon thread — a traceback, no banner.
+        if not isinstance(data, dict):
             return
 
         tag = data.get("tag_name", "")
@@ -88,8 +119,8 @@ def check_for_update(parent: "tk.Toplevel", current_version: str) -> None:
             return
 
         try:
-            latest = _parse_version(tag)
-            current = _parse_version(current_version)
+            latest = _version_key(tag)
+            current = _version_key(current_version)
         except Exception:
             return
 

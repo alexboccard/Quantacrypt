@@ -125,7 +125,10 @@ markers = [
     "gui: drives real Tk widgets — must run serially (the window server is shared state)",
     "needs_real_window: needs a focusable window, so test-window hiding is suspended for it",
 ]
-addopts = "--cov=quantacrypt.core --cov-report=term-missing --cov-report=html:htmlcov"
+# --cov=quantacrypt (the package), not quantacrypt.core: pytest-cov's --cov
+# overrides [tool.coverage.run] source, so the narrower value silently made
+# the documented `python -m pytest` and the release gate core-only.
+addopts = "--cov=quantacrypt --cov-report=term-missing --cov-report=html:htmlcov"
 
 [tool.coverage.run]
 # The whole package, not core/ alone: scoping the measurement to core/ meant

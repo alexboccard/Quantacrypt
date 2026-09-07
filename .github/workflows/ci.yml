@@ -96,6 +96,7 @@ jobs:
       # loadable libfuse (every macOS runner), and this is the one job that
       # installs one, so a silent skip here would be a regression nobody sees.
       - name: Assert the FUSE tests were not skipped
+        shell: bash   # adds -o pipefail: a failure upstream of `tee` must fail the step
         run: |
           python -m pytest tests/test_core_edges.py tests/test_audit_2026_09.py -q -o addopts="" \
             --no-header -p no:cacheprovider -p no:randomly -rs \
@@ -108,6 +109,7 @@ jobs:
       # Assert the GUI suite really ran: a display that silently fails to
       # start would put us straight back to ~116 quiet skips.
       - name: Assert the GUI tests were not skipped
+        shell: bash   # adds -o pipefail: a failure upstream of `tee` must fail the step
         run: |
           xvfb-run -a python -m pytest tests/test_gui_logic.py -q -o addopts="" \
             --no-header -p no:cacheprovider -p no:randomly -rs 2>&1 | tee /tmp/gui.txt

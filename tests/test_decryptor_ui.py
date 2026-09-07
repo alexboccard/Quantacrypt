@@ -3233,12 +3233,12 @@ class TestSuccessCard:
         app._done(str(out), 4096, fname="report.pdf", sz=4096, ts=1_600_000_000,
                   renamed=True)
         texts = _widget_texts(app._results)
-        assert "4.0 KB" in texts
+        assert "4.1 KB" in texts                      # 4096 B, decimal units
         assert str(out) in texts
         assert "report.pdf" in texts
         assert any("already existed there" in t and "report_2.pdf" in t
                    for t in texts)
-        assert any(t.startswith("Original: 4.0 KB") and "Encrypted:" in t
+        assert any(t.startswith("Original: 4.1 KB") and "Encrypted:" in t
                    for t in texts)
 
     def test_the_filename_line_is_dropped_when_it_matches_the_output(self,

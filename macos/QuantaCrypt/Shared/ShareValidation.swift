@@ -85,10 +85,8 @@ enum ShareValidation {
     static func formatProblem(_ share: String) -> String? {
         let text = share.trimmingCharacters(in: .whitespacesAndNewlines)
         if text.uppercased().hasPrefix(codePrefix) {
-            // The helper's `decode_share` matches the prefix case-sensitively.
-            if !text.hasPrefix(codePrefix) {
-                return "a code starts with QCSHARE- in capitals"
-            }
+            // The helper's `decode_share` accepts the prefix in any case, as
+            // every caller already routed it (review F-011).
             return codeIdentity(text) == nil
                 ? "the QCSHARE- code is incomplete or has a typo; copy it again from the share file"
                 : nil

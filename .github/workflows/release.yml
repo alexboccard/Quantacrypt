@@ -33,6 +33,9 @@ jobs:
   test:
     name: Run tests
     runs-on: macos-14
+    # Every build job is capped at 60; the GUI suite on macOS was the one
+    # job left on the 6-hour default.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
@@ -56,7 +59,13 @@ jobs:
       # shuffled run is the only thing that catches order-dependence, but a
       # release gate has to be reproducible, not exploratory.
       - name: Run tests
-        run: python -m pytest --tb=short -q -p no:randomly
+        run: python -m pytest --tb=short -q -p no:randomly --cov-report=json:coverage.json
+
+      # The aggregate fail_under can read 95% while a single file sits far
+      # below it; ci.yml already gates per file and the release must not be
+      # the weaker of the two.
+      - name: Enforce per-file coverage floor
+        run: python scripts/check_coverage.py --min 95 --json coverage.json
 
   build-arm64:
     name: Build (arm64)
@@ -315,7 +324,18 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_name }}
         run: |
-          gh release create "$TAG" release/*.dmg release/SHA256SUMS \
+          # A pre-release must not become `releases/latest`: the in-app
+          # updater polls that, so a beta there is offered to every stable
+          # user (review F-201).  gh marks one only when asked.
+          # The verdict, not an exit status: a probe that cannot run must
+          # not read as "stable release".
+          verdict=$(python3 -c 'import sys; sys.path.insert(0, "scripts"); from stamp_version import is_prerelease; print("yes" if is_prerelease(sys.argv[1]) else "no")' "${TAG#v}")
+          case "$verdict" in
+            yes) pre=(--prerelease --latest=false) ;;
+            no)  pre=() ;;
+            *)   echo "::error::could not classify $TAG as a release or a pre-release (got '$verdict')"; exit 1 ;;
+          esac
+          gh release create "$TAG" release/*.dmg release/SHA256SUMS "${pre[@]}" \
             --title "QuantaCrypt $TAG" \
             --generate-notes \
             --notes "Verify a download with \`shasum -a 256 -c SHA256SUMS\` (macOS) or \`sha256sum -c SHA256SUMS\`, and its provenance with \`gh attestation verify <file> --owner alexboccard\`."
@@ -336,10 +356,46 @@ jobs:
         with:
           ref: master
           persist-credentials: false
+          fetch-depth: 0           # the ancestry check below needs history
 
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: ${{ env.PYTHON_VERSION }}
+
+      # A maintenance tag on an older commit (v1.3.1 while master is 1.4.0)
+      # must not rewrite master's version files and lock to the older
+      # version — and would have done so with [skip ci].
+      - name: Refuse to stamp master from a tag on another history or an older version
+        run: |
+          set +e
+          git merge-base --is-ancestor "$GITHUB_SHA" HEAD
+          rc=$?
+          set -e
+          case $rc in
+            0) ;;
+            1) echo "::notice::${GITHUB_REF#refs/tags/} is not on master; leaving master untouched"; exit 0 ;;
+            *) echo "::error::git merge-base failed (exit $rc)"; exit "$rc" ;;
+          esac
+          # A tag on master's history but older than what master carries
+          # (a hotfix tagged on an earlier commit) must not roll master back.
+          python3 - "${GITHUB_REF#refs/tags/v}" <<'PY'
+          import re, sys, tomllib
+          # The same order as the updater's _version_key: a pre-release
+          # ranks below its final, so a v1.5.0-beta tag pushed after 1.5.0
+          # is on master leaves master alone.
+          def key(v):
+              m = re.match(r"(\d+(?:\.\d+)*)", v)
+              if not m: return None
+              rest = v[m.end():].strip().lstrip("-._").lower()
+              rank = 0 if not rest or rest.startswith("+") else (1 if rest.startswith("post") else -1)
+              return tuple(int(p) for p in m.group(1).split(".")) + (rank,)
+          tag, cur = sys.argv[1], tomllib.load(open("pyproject.toml", "rb"))["project"]["version"]
+          if key(tag) is None:
+              print(f"::notice::{tag!r} is not a version; leaving master untouched"); sys.exit(0)
+          if key(tag) < (key(cur) or (0, 0)):
+              print(f"::notice::v{tag} is older than master's {cur}; leaving master untouched"); sys.exit(0)
+          with open(__import__("os").environ["GITHUB_ENV"], "a") as f: f.write("on_master=1\n")
+          PY
 
       # Same structural stamp as the build jobs, so master cannot end up
       # carrying a version the release never built.  It also reaches
@@ -347,6 +403,7 @@ jobs:
       # app's CFBundleShortVersionString has been stamped in CI and then
       # left at the old value in the repo on every release so far.
       - name: Update version files
+        if: env.on_master == '1'
         run: python3 scripts/stamp_version.py "${GITHUB_REF#refs/tags/v}"
 
       # uv.lock records the project's own version, so bumping pyproject.toml
@@ -355,6 +412,7 @@ jobs:
       # installs from with --require-hashes; uv comes from that same lock so
       # the resolver version is pinned too.
       - name: Regenerate the dependency lock
+        if: env.on_master == '1'
         run: |
           python scripts/lock_subset.py setuptools > "$RUNNER_TEMP/build-requirements.txt"
           pip install --require-hashes -r "$RUNNER_TEMP/build-requirements.txt"
@@ -364,6 +422,7 @@ jobs:
             --format requirements.txt -o requirements-lock.txt
 
       - name: Commit and push
+        if: env.on_master == '1'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |

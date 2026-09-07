@@ -1101,11 +1101,12 @@ class TestFUSEEdgeCases:
         # Clear buffer
         fuse_fs._file_buffers.pop("/trunc_load.txt", None)
 
-        # Truncate should load from volume first
+        # Truncate loads the surviving prefix from the volume, persists it
+        # (no fd will ever flush it) and, since run 14 F-010, drops the
+        # buffer again so the plaintext does not stay resident.
         fuse_fs.truncate("/trunc_load.txt", 8)
-        buf = fuse_fs._file_buffers.get("/trunc_load.txt")
-        assert buf is not None
-        assert bytes(buf) == b"truncate"
+        assert "/trunc_load.txt" not in fuse_fs._file_buffers
+        assert fuse_fs.volume.read_file("/trunc_load.txt") == b"truncate"
 
     def test_read_uses_chunk_cache(self, fuse_fs):
         """Reads populate and reuse the chunk-granular LRU cache.
@@ -1547,7 +1548,7 @@ class TestUnmountVolume:
         tearing down another app's FUSE mount, so unmount_volume now raises
         ValueError when the caller passes a path we do not own.
         """
-        with pytest.raises(ValueError, match="No QuantaCrypt volume is tracked"):
+        with pytest.raises(ValueError, match="already have been ejected"):
             unmount_volume("/nonexistent/mount/point")
 
     def test_unmount_clean_volume(self, tmp_dir):
@@ -1592,6 +1593,7 @@ class TestUnmountVolume:
         from unittest.mock import MagicMock
         vc.save = MagicMock(side_effect=OSError("disk full"))
         vc._dirty = True
+        # The PRE-unmount save failing keeps the mount alive and raises.
         with pytest.raises(OSError, match="disk full"):
             unmount_volume(mp)
         # Volume should still be tracked so _emergency_save_all can retry
@@ -2027,6 +2029,29 @@ class TestLazyBlobLoad:
         assert vc2.read_file("/new.txt") == b"NEW" * 500
 
 
+def _downgrade_to_v1(path: str, key: bytes) -> None:
+    """Rewrite a fresh container the way the v1 code wrote it: header version
+    1 and sealed ``format_version`` 1 (the first volume commit, 69ccf52, sealed
+    the field from the start).  Patching the header word alone no longer
+    simulates an old build — open() cross-checks it against the sealed copy
+    and reports tampering."""
+    with open(path, "rb") as f:
+        header = vol.read_header(f)
+        auth = vol._read_auth_params(f)
+        meta_ct = vol._read_encrypted_block(f)
+        dir_ct = vol._read_encrypted_block(f)
+        rest = f.read()
+    meta = vol.decrypt_metadata(key, header["meta_nonce"], meta_ct)
+    meta["format_version"] = 1
+    meta_nonce, meta_ct = vol.encrypt_metadata(key, meta)
+    with open(path, "wb") as f:
+        vol.write_header(f, header["volume_id"], meta_nonce, header["dir_nonce"], version=1)
+        vol._write_auth_params(f, auth)
+        vol._write_encrypted_block(f, meta_ct)
+        vol._write_encrypted_block(f, dir_ct)
+        f.write(rest)
+
+
 class TestFormatV2Journal:
     """Coverage for the v2 append-only journal: replay, auto-compact,
     v1→v2 upgrade, and graceful handling of corrupt / partial records."""
@@ -2152,11 +2177,7 @@ class TestFormatV2Journal:
         container at the lowest version that describes it lets older builds
         keep opening it."""
         path, key = self._open(tmp_dir, "v1.qcv")
-        # Patch the header VERSION field from 2 back to 1 on disk to
-        # simulate a container created by an older build.
-        with open(path, "r+b") as f:
-            f.seek(6)  # _OFF_VERSION
-            f.write(struct.pack(">I", 1))
+        _downgrade_to_v1(path, key)
 
         vc = vol.VolumeContainer(path, key)
         vc.open()
@@ -2173,10 +2194,8 @@ class TestFormatV2Journal:
     def test_v1_container_rejects_trailing_bytes(self, tmp_dir):
         """A v1 container with bytes past the baseline is corrupt."""
         path, key = self._open(tmp_dir, "v1_trail.qcv")
-        with open(path, "r+b") as f:
-            f.seek(6)
-            f.write(struct.pack(">I", 1))
-            f.seek(0, 2)
+        _downgrade_to_v1(path, key)
+        with open(path, "ab") as f:
             f.write(b"junk-bytes-pretending-to-be-v2-journal")
 
         vc = vol.VolumeContainer(path, key)
@@ -3621,8 +3640,10 @@ class TestUnmountCleanupNotStranded:
         }
         try:
             with _patched_unmount_subprocess():
-                with pytest.raises(OSError, match="disk full"):
-                    unmount_volume(mp)
+                # Run 17: the post-unmount persistence failure is logged, not
+                # raised — the OS unmount already succeeded and a retry would
+                # find no mount to act on.
+                unmount_volume(mp)
             assert mp not in _mounted_volumes, \
                 "cleanup failure must not strand a torn-down mount"
         finally:
@@ -3693,7 +3714,8 @@ class TestFlushSkipsUnchangedContent:
         fs.flush("/a.txt", 0)
         calls = []
         real = fs.volume.write_file
-        monkeypatch.setattr(fs.volume, "write_file", lambda v, d: (calls.append(v), real(v, d)))
+        monkeypatch.setattr(fs.volume, "write_file",
+                            lambda v, d, **kw: (calls.append(v), real(v, d, **kw)))
         # Same bytes written again (an editor re-saving, rsync --fsync)
         fs.write("/a.txt", b"hello world", 0, 0)
         fs.fsync("/a.txt", 0, 0)

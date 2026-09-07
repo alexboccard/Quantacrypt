@@ -848,8 +848,12 @@ class TestCompactFailureLeavesNoDebris:
         # writer or a failing disk would.
         with open(path, "r+b") as f:
             f.truncate(vc._data_offset + 10)
-        with pytest.raises(ValueError, match="truncated while copying"):
+        # Run 19 F-202: refused before a temp file is even created — the
+        # container is no longer what open() read (ESTALE), so the
+        # mid-copy "truncated" ValueError is never reached.
+        with pytest.raises(OSError) as ei:
             vc.compact()
+        assert ei.value.errno == errno.ESTALE
         assert not _compact_temps(path)
 
     def test_a_failed_temp_cleanup_does_not_mask_the_real_error(
@@ -857,15 +861,19 @@ class TestCompactFailureLeavesNoDebris:
         path, key, vc = volume
         vc.write_file("/a.bin", b"x" * 5000)
         vc.compact()
-        with open(path, "r+b") as f:
-            f.truncate(vc._data_offset + 10)
-
+        # A failure once the temp exists (the fsync of the new baseline);
+        # shortening the source is refused earlier since run 19 F-202.
         def _refuse(_p):
             raise OSError(errno.EPERM, "cannot unlink")
 
+        def _fail_fsync(_fd):
+            raise OSError(errno.EIO, "Input/output error")
+
         monkeypatch.setattr(os, "unlink", _refuse)
-        with pytest.raises(ValueError, match="truncated while copying"):
+        monkeypatch.setattr(os, "fsync", _fail_fsync)
+        with pytest.raises(OSError) as ei:
             vc.compact()
+        assert ei.value.errno == errno.EIO, "the real error, not the cleanup's"
         monkeypatch.undo()
         # The temp survives precisely because the cleanup failed — that is
         # the branch under test.
@@ -1510,7 +1518,8 @@ class TestMountVolume:
         assert isinstance(obj, QuantaCryptFUSE)
         assert seen["ops"] is obj
         assert seen["mount_point"] == mp
-        assert seen["volname"] == "QuantaCrypt"
+        # Named after the container (run 13 F-004), not a constant.
+        assert seen["volname"] == os.path.splitext(os.path.basename(path))[0]
         assert os.path.isdir(mp)               # created for us
         assert mp not in fo._mounted_volumes   # foreground never registers
         assert self._lock_is_free(path)
@@ -1635,7 +1644,7 @@ class TestUnmountVolume:
         that refusal disturb the mounts we do own."""
         _, _, _, _, mp = tracked
         before = dict(fo._mounted_volumes)
-        with pytest.raises(ValueError, match="do not own"):
+        with pytest.raises(ValueError, match="already have been ejected"):
             fo.unmount_volume(str(tmp_path / "not-ours"))
         assert fo._mounted_volumes == before
         assert mp in fo._mounted_volumes
@@ -1718,7 +1727,8 @@ class TestExtractShareCodes:
     survive headers, prose, and a share with a typo in it."""
 
     @pytest.fixture(scope="class")
-    def three_shares(self):
+    @classmethod
+    def three_shares(cls):
         """Three (code, mnemonic) pairs, built from fixed values.
 
         Deliberately NOT from shamir_split(): the mnemonic carries an 8-bit
@@ -1738,7 +1748,8 @@ class TestExtractShareCodes:
         return out
 
     @pytest.fixture(scope="class")
-    def one_share(self, three_shares):
+    @classmethod
+    def one_share(cls, three_shares):
         return three_shares[0]
 
     def test_a_genuine_shamir_share_is_recognised_in_both_forms(self):
@@ -1764,8 +1775,10 @@ class TestExtractShareCodes:
     def test_three_shares_in_mixed_forms_all_come_back_once_each(
             self, three_shares):
         """Zero / one / many for the scan loop — this is the "many" case, and
-        it pins the order the recovery UI fills its slots in: every QCSHARE
-        line first, in file order, then the mnemonics."""
+        it pins the order the recovery UI fills its slots in: order of
+        appearance, codes and phrases alike (run 14 F-018 made the code
+        match the docstring; a repeated share collapses onto its first
+        appearance)."""
         (c0, m0), (c1, m1), (c2, m2) = three_shares
         text = (
             "QuantaCrypt recovery kit\n"
@@ -1776,7 +1789,7 @@ class TestExtractShareCodes:
             "\nAnd share 1 again, as words:\n"
             f"{m0}\n"
         )
-        assert pkg.extract_share_codes(text) == [c1, c0, c2]
+        assert pkg.extract_share_codes(text) == [c1, c2, c0]
 
     def test_a_lone_share_is_found_without_any_surrounding_text(self, one_share):
         code, _ = one_share
@@ -1994,7 +2007,8 @@ class TestDecryptQcxFailurePaths:
     must leave the output directory as it found it."""
 
     @pytest.fixture(scope="class")
-    def qcx(self, tmp_path_factory):
+    @classmethod
+    def qcx(cls, tmp_path_factory):
         d = tmp_path_factory.mktemp("qcx_edges")
         src = d / "notes.txt"
         src.write_bytes(b"quantum-safe notes " * 50)
@@ -2334,7 +2348,8 @@ class TestContentIntegrityCheck:
     but a recorded hash is still honoured when one is present."""
 
     @pytest.fixture(scope="class")
-    def encrypted(self, tmp_path_factory):
+    @classmethod
+    def encrypted(cls, tmp_path_factory):
         d = tmp_path_factory.mktemp("integrity")
         src = d / "data.bin"
         src.write_bytes(b"content integrity " * 100)

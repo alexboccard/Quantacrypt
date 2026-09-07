@@ -17,8 +17,9 @@ python3 scripts/stamp_version.py 1.4.0 --check  # verify only
 ```
 
 It rewrites `pyproject.toml`, `src/quantacrypt/__init__.py` and
-`macos/project.yml`'s `CFBundleShortVersionString`, and **exits non-zero if any
-of the three no longer matches** — the `sed` substitutions it replaced exited 0
+`macos/project.yml` (`CFBundleShortVersionString`, and the numeric prefix
+into `CFBundleVersion`), and **exits non-zero if any of the four targets no
+longer matches** — the `sed` substitutions it replaced exited 0
 on a no-match and would have shipped a release labelled with the previous
 version. Since the in-app update checker compares the running version against
 GitHub Releases, that left every user on an "update available" banner that
@@ -54,10 +55,32 @@ carries the version that was actually released.
    (Tkinter app), and `QuantaCrypt-native-arm64.dmg` (native SwiftUI app),
    plus `SHA256SUMS`.
 
+## Pre-release tags
+
+A `v1.5.0-beta` tag is stamped in its PEP 440 spelling, `1.5.0b0`, into
+every version file and `CFBundleShortVersionString` (that is what setuptools
+would write into the wheel anyway, so `importlib.metadata`, the plists and
+the fallback literal agree), and `1.5.0` into `CFBundleVersion`
+(LaunchServices accepts only integers there and orders duplicate app copies
+by it). The beta and the final release therefore share one build number: do
+not keep both installed side by side. The in-app update checker parses the
+PEP 440 form (`1.5.0b0` and the tag `v1.5.0-beta` compare equal and both
+rank below the stable `v1.5.0`, so a beta build is offered the final). The
+GitHub release is created with `--prerelease --latest=false`, so it never
+becomes `releases/latest` — the endpoint the updater polls — and stable
+users are not offered the beta. A `+local` segment is refused by
+`stamp_version.py`. The guard test that every stamped file
+agrees compares each file against what a pre-release should carry.
+
 ## Local build (without CI)
 
 ```bash
-pip install --require-hashes -r requirements-lock.txt && pip install --no-deps -e .
+# Same shape as CI: the build backend from the lock first, then no build
+# isolation so nothing outside the lock is ever fetched.
+python scripts/lock_subset.py setuptools > /tmp/build-requirements.txt
+pip install --require-hashes -r /tmp/build-requirements.txt
+pip install --no-build-isolation --require-hashes -r requirements-lock.txt
+pip install --no-deps --no-build-isolation -e .
 
 # Build for current machine's architecture
 python scripts/build.py

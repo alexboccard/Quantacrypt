@@ -22,9 +22,11 @@ struct HelperLaunch: Sendable, Equatable {
     /// Which resolution rule produced this launch, for the status line.
     let origin: String
     /// The code hash this binary had when it was resolved, re-measured
-    /// immediately before `exec`. Bundled and approved helpers both carry
-    /// one; nil only for a launch whose signature was never pinned (the
-    /// DEBUG-only development helpers, which are Python scripts).
+    /// immediately before `exec`. Approved helpers and a bundled helper
+    /// under the app's own signature carry one; nil for a launch whose
+    /// signature was never pinned — the DEBUG-only development helpers
+    /// (Python scripts) and a bundled helper signed under another identity,
+    /// which is trusted by location and not re-measured.
     let approvedCDHash: Data?
 
     init(executable: URL, arguments: [String], origin: String, approvedCDHash: Data? = nil) {
@@ -155,13 +157,18 @@ actor ProcessTransport: CoreTransport {
         // proved unreliable on a pipe here (it delivered the first line or
         // nothing, depending on timing), and a helper that answers "never"
         // is the worst failure mode this client can have.
-        // Tracebacks and unmount failures are the only trace of why a
+        // The helper's own ERROR-level lines are the only trace of why a
         // volume was torn down uncleanly, so they must survive the default
-        // log level and stay `.public`. Everything else on stderr is the
-        // helper's INFO logging, which names volume paths and mount points;
-        // that is `.private` so it is redacted in a log a user hands over.
+        // log level and stay `.public`; the helper keeps them path-free
+        // (errno and strerror only) and prefixes every line of a traceback
+        // with its record's level, so the rule holds line by line. Paths —
+        // container, mount point, and since run 13 files inside a vault —
+        // travel on INFO/WARNING/DEBUG lines, which are `.private` and so
+        // redacted in a log a user hands over. Decided by the level prefix,
+        // not by a substring anywhere in the line: a vault file called
+        // "Error report.docx" must not make its line public.
         Self.readLines(from: stderr.fileHandleForReading, name: "stderr") { line in
-            if line.contains("Traceback") || line.contains("Error") {
+            if Self.isPublicStderrLine(line) {
                 Logger.helper.error("\(line, privacy: .public)")
             } else {
                 Logger.helper.info("\(line, privacy: .private)")
@@ -193,6 +200,14 @@ actor ProcessTransport: CoreTransport {
     /// about to be written to whatever gets exec'd. `Process` takes a path,
     /// not a descriptor, so this narrows the window rather than closing it;
     /// closing it needs `fexecve`, which `Process` does not expose.
+    /// Which helper stderr lines are `.public` in the unified log — see
+    /// the note in `start()`. A bare `Traceback` only arrives from an
+    /// interpreter that died before logging was configured.
+    static func isPublicStderrLine(_ line: String) -> Bool {
+        line.hasPrefix("Traceback") || line.hasPrefix("qc-core ERROR ")
+            || line.hasPrefix("qc-core CRITICAL ") || line.hasPrefix("qc-core: ")
+    }
+
     private func verifyStillTheApprovedBinary() throws {
         guard let expected = launch.approvedCDHash else { return }
         let now = HelperLocator.signatureStatus(of: launch.executable)

@@ -290,6 +290,16 @@ final class CoreClientTests: XCTestCase {
         XCTAssertEqual(waited, .seconds(10))
     }
 
+    /// The helper's teardown is a 5 s join plus up to 30 s per wedged
+    /// `diskutil unmount`, one per mounted volume; a flat 30 s SIGTERMed it
+    /// mid-loop with two volumes up (F-006).
+    func testTheShutdownDeadlineGrowsWithEachMountedVolume() {
+        XCTAssertEqual(CoreClient.shutdownTimeout(mountedVolumes: 0), .seconds(45))
+        XCTAssertEqual(CoreClient.shutdownTimeout(mountedVolumes: 1), .seconds(45))
+        XCTAssertEqual(CoreClient.shutdownTimeout(mountedVolumes: 2), .seconds(80))
+        XCTAssertEqual(CoreClient.shutdownTimeout(mountedVolumes: 3), .seconds(115))
+    }
+
     func testTransportFactoryFailureSurfacesAsCoreError() async {
         let client = CoreClient {
             throw CoreError(code: .helperUnavailable, message: "missing", detail: "searched")

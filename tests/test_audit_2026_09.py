@@ -297,12 +297,6 @@ class TestChunkEncryptor:
     def small_chunks(self, monkeypatch):
         monkeypatch.setattr(cc, "CHUNK_SIZE", 1000)
 
-    def _decrypt(self, buf, key, count, nonce):
-        src = io.BytesIO(buf)
-        path_holder = {}
-        # stream_decrypt_payload takes a path: write the bytes out.
-        return src, path_holder
-
     @pytest.mark.parametrize("size", [0, 1, 999, 1000, 1001, 2000, 2001, 5555])
     def test_any_piece_pattern_yields_the_file_stream(self, tmp_path, size):
         """Pushing the same bytes in odd-sized pieces must produce a stream
@@ -401,8 +395,8 @@ class TestFolderEncryptionStreams:
         out = str(tmp_path / "docs.qcx")
         res = pkg.encrypt_to_qcx(str(folder), out, mode="password", password=PW)
         assert res["skipped_symlinks"] == ["link.txt"]
-        got = pkg.decrypt_qcx(out, str(tmp_path / "o"), password=PW) \
-            if (tmp_path / "o").mkdir() is None else None
+        (tmp_path / "o").mkdir()
+        got = pkg.decrypt_qcx(out, str(tmp_path / "o"), password=PW)
         assert got["original_size"] == os.path.getsize(got["output"]) > 0
         with zipfile.ZipFile(got["output"]) as zf:
             assert sorted(zf.namelist()) == ["docs/", "docs/a.txt", "docs/sub/"]

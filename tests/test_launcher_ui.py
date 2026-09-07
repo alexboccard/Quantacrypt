@@ -1460,7 +1460,11 @@ class TestParseVersion:
     @pytest.mark.parametrize("tag,expected", [
         ("1.2.x", (1, 2)),      # parsing stops at the first non-numeric part
         ("1..2", (1,)),
-        ("1.2.3dev", (1, 2)),
+        # Run 17: the leading numeric release is what counts, so a PEP 440
+        # suffix glued to the last component no longer drops that component
+        # ("1.5.0b0" used to read as (1, 5) and every stable 1.5.x looked newer).
+        ("1.2.3dev", (1, 2, 3)),
+        ("1.5.0b0", (1, 5, 0)),
     ])
     def test_parsing_stops_at_the_first_bad_component(self, tag, expected):
         assert updater._parse_version(tag) == expected
@@ -1547,6 +1551,18 @@ class TestCheckForUpdate:
         assert delay == 0
         parent.fire()
         assert shown == [(parent, "1.9.0", "1.3.0", "v1.9.0", "https://x.test/rel")]
+
+    @pytest.mark.parametrize("current,tag,banner", [
+        ("1.5.0b0", "v1.5.0", True),        # run 18 F-001: the final is the update a beta waits for
+        ("1.5.0b0", "v1.5.0-beta", False),  # its own tag
+        ("1.5.0", "v1.5.0-beta", False),    # the final never offers its beta
+        ("1.5.0", "v1.5.2b0", True),        # a newer beta is still newer
+        ("1.5.0", "v1.5.0", False),
+    ])
+    def test_pre_release_rank(self, monkeypatch, sync_worker, prefs_only, shown,
+                              current, tag, banner):
+        parent = self._run(monkeypatch, {"tag_name": tag, "html_url": "u"}, current=current)
+        assert bool(parent.calls) is banner
 
     def test_a_launcher_closed_before_the_hop_fires_gets_no_banner(
             self, monkeypatch, sync_worker, prefs_only, shown):
@@ -1656,15 +1672,13 @@ class TestCheckForUpdate:
                            current=None)
         assert parent.calls == []
 
-    def test_a_non_dict_release_document_crashes_the_worker(self, monkeypatch,
-                                                            sync_worker,
-                                                            prefs_only):
-        """Documented defect: `_fetch_latest` is annotated Optional[dict] but
-        returns whatever the JSON parsed to, so a top-level array reaches
-        `data.get`.  In production this dies unseen on the daemon thread — the
-        sync shim only makes it visible.  See bugsFound."""
-        with pytest.raises(AttributeError):
-            self._run(monkeypatch, ["not", "a", "dict"])
+    def test_a_non_dict_release_document_is_ignored(self, monkeypatch,
+                                                    sync_worker, prefs_only):
+        """`_fetch_latest` returns whatever the JSON parsed to; a top-level
+        array (or a captive-portal page that happens to parse) used to reach
+        `data.get` and die unseen on the daemon thread (run 13 F-036)."""
+        parent = self._run(monkeypatch, ["not", "a", "dict"])
+        assert parent.calls == []
 
     def test_the_check_runs_off_the_main_thread_as_a_daemon(self, monkeypatch,
                                                             prefs_only):

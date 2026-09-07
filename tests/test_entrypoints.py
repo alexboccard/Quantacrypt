@@ -58,7 +58,11 @@ class FakeRoot:
         self.after_calls = []
         self.mainloop_count = 0
         self.destroyed = False
+        self.children = []
         self._createcommand_error = createcommand_error
+
+    def winfo_children(self):
+        return list(self.children)
 
     def createcommand(self, name, fn):
         if self._createcommand_error is not None:
@@ -304,6 +308,101 @@ class TestBinaryHasQcxPayload:
 
 
 # ── _register_open_document ──────────────────────────────────────────────────
+
+class TestRegisterQuit:
+    """Run 18 F-205: Tk Aqua answers the Quit Apple event (app menu, Dock,
+    ⌘Q) with `exit` unless ::tk::mac::Quit exists — no mounted-volume guard,
+    no unmount, no clipboard wipe."""
+
+    def test_the_launcher_is_asked_like_any_window_then_the_app_tears_down(self, monkeypatch):
+        root = FakeRoot()
+        launcher = SimpleNamespace(asked=0, winfo_exists=lambda: True)
+        launcher.can_quit = lambda: (setattr(launcher, "asked", launcher.asked + 1), True)[1]
+        wiped = []
+        from quantacrypt.ui import shared
+        monkeypatch.setattr(shared.ClipboardTimer, "wipe_all", classmethod(lambda cls: wiped.append(1)))
+        qmain._register_quit(root, launcher)
+        root.commands["::tk::mac::Quit"]()
+        assert launcher.asked == 1 and root.destroyed and wiped == [1]
+
+    def test_the_launcher_can_veto(self, monkeypatch):
+        root = FakeRoot()
+        launcher = SimpleNamespace(winfo_exists=lambda: True, can_quit=lambda: False)
+        from quantacrypt.ui import shared
+        monkeypatch.setattr(shared.ClipboardTimer, "wipe_all", classmethod(lambda cls: None))
+        qmain._register_quit(root, launcher)
+        root.commands["::tk::mac::Quit"]()
+        assert not root.destroyed
+
+    def test_wipes_the_clipboard_and_tears_down_without_a_launcher(self, monkeypatch):
+        root = FakeRoot()
+        wiped = []
+        from quantacrypt.ui import shared
+        monkeypatch.setattr(shared.ClipboardTimer, "wipe_all", classmethod(lambda cls: wiped.append(1)))
+        qmain._register_quit(root)
+        root.commands["::tk::mac::Quit"]()
+        assert wiped == [1] and root.destroyed
+
+    def test_a_gone_launcher_falls_back_to_the_teardown(self, monkeypatch):
+        root = FakeRoot()
+        gone = SimpleNamespace(winfo_exists=lambda: (_ for _ in ()).throw(RuntimeError("destroyed")),
+                               can_quit=lambda: (_ for _ in ()).throw(RuntimeError("gone")))
+        from quantacrypt.ui import shared
+        monkeypatch.setattr(shared.ClipboardTimer, "wipe_all", classmethod(lambda cls: None))
+        qmain._register_quit(root, gone)
+        root.commands["::tk::mac::Quit"]()
+        assert root.destroyed
+
+    def test_survives_a_tk_without_the_command(self):
+        root = FakeRoot(createcommand_error=RuntimeError("bad option"))
+        qmain._register_quit(root)
+        assert root.commands == {}
+
+    def test_a_wizard_can_veto_the_quit_and_no_window_is_committed_first(self, monkeypatch):
+        """Run 19 F-001 + run 20 F-005: every window's can_quit() is a pure
+        predicate; a later veto must not leave an earlier window's job
+        already cancelled, so commit_quit() runs only after all consent."""
+        root = FakeRoot()
+        events = []
+        vetoer = SimpleNamespace(can_quit=lambda: events.append("veto-asked") or False)
+        worker = SimpleNamespace(can_quit=lambda: events.append("worker-asked") or True,
+                                 commit_quit=lambda: events.append("worker-committed"))
+        root.children = [worker, vetoer]
+        launcher = SimpleNamespace(winfo_exists=lambda: True, can_quit=lambda: True)
+        from quantacrypt.ui import shared
+        monkeypatch.setattr(shared.ClipboardTimer, "wipe_all", classmethod(lambda cls: None))
+        qmain._register_quit(root, launcher)
+        root.commands["::tk::mac::Quit"]()
+        assert "worker-committed" not in events and not root.destroyed   # nothing committed on a veto
+        vetoer.can_quit = lambda: True
+        events.clear()
+        root.commands["::tk::mac::Quit"]()
+        assert "worker-committed" in events and root.destroyed
+
+    def test_the_launcher_unmount_never_runs_before_a_wizard_vetoes(self, monkeypatch):
+        """Run 21 F-002: the launcher's can_quit() unmounts as a side effect,
+        so it must be asked LAST — a wizard that vetoes first must keep the
+        drives mounted.  The prior tests only used a pure-lambda launcher."""
+        root = FakeRoot()
+        events = []
+        # A launcher whose can_quit unmounts (the real one does), placed FIRST
+        # in winfo_children() as the real LauncherApp is.
+        launcher = SimpleNamespace(winfo_exists=lambda: True,
+                                   can_quit=lambda: events.append("launcher-unmounted") or True)
+        busy_wizard = SimpleNamespace(can_quit=lambda: events.append("wizard-vetoed") or False)
+        root.children = [launcher, busy_wizard]
+        from quantacrypt.ui import shared
+        monkeypatch.setattr(shared.ClipboardTimer, "wipe_all", classmethod(lambda cls: None))
+        qmain._register_quit(root, launcher)
+        root.commands["::tk::mac::Quit"]()
+        assert "launcher-unmounted" not in events, "the veto must precede the unmount"
+        assert not root.destroyed
+        # With the wizard consenting, the launcher is asked last and the app quits.
+        busy_wizard.can_quit = lambda: events.append("wizard-ok") or True
+        events.clear()
+        root.commands["::tk::mac::Quit"]()
+        assert events == ["wizard-ok", "launcher-unmounted"] and root.destroyed
+
 
 class TestRegisterOpenDocument:
     """The macOS Apple Event handler: it routes dropped files to the right
@@ -1008,6 +1107,33 @@ def restore_signals():
         signal.signal(sig, handler)
 
 
+class TestHelperLogFormat:
+    """Run 18 F-003: the Swift shell decides a stderr line's privacy by its
+    level prefix, line by line; a traceback's frames arrived bare and were
+    redacted — the cause line with them."""
+
+    def test_every_traceback_line_carries_the_level_prefix(self):
+        fmt = qcli._LevelPrefixedFormatter(qcli._LOG_FORMAT)
+        try:
+            raise PermissionError(13, "Permission denied", "/v/x.qcv")
+        except PermissionError:
+            rec = logging.LogRecord("quantacrypt.core.fuse_ops", logging.INFO, __file__, 1,
+                                    "post-eject save failure at %s", ("/mnt/v",), sys.exc_info())
+        lines = fmt.format(rec).split("\n")
+        assert lines[0] == "qc-core INFO quantacrypt.core.fuse_ops: post-eject save failure at /mnt/v"
+        assert len(lines) > 3
+        assert all(l.startswith("qc-core INFO quantacrypt.core.fuse_ops: ") for l in lines[1:])
+        assert lines[1].endswith("Traceback (most recent call last):")
+        assert lines[-1].endswith("PermissionError: [Errno 13] Permission denied: '/v/x.qcv'")
+        plain = logging.LogRecord("x", logging.ERROR, __file__, 1, "one line", (), None)
+        assert fmt.format(plain) == "qc-core ERROR x: one line"
+
+    def test_main_installs_it_on_the_root_logger(self, helper):
+        logging.root.handlers[:] = []          # basicConfig is a no-op otherwise
+        helper.run(io.StringIO(""))
+        assert [type(h.formatter) for h in logging.root.handlers] == [qcli._LevelPrefixedFormatter]
+
+
 @pytest.fixture
 def root_log_handlers():
     """cli.main() calls logging.basicConfig; keep it out of later tests."""
@@ -1049,6 +1175,29 @@ def helper(monkeypatch, restore_signals, root_log_handlers):
 
 def _lines(*reqs):
     return io.StringIO("".join(json.dumps(r) + "\n" for r in reqs))
+
+
+class TestQcCoreTermHandler:
+    """SIGTERM while the loop is blocked on stdin: the handler raises
+    ServiceStop once to unwind the read, main() swallows it and exits 0.
+    (The joins inside shutdown() now catch a ServiceStop of their own, so
+    this is the path that still has to reach main's except.)"""
+
+    def test_a_signal_during_the_stdin_read_ends_the_session_cleanly(self, helper):
+        class Interrupting(io.StringIO):
+            def _fire(self):
+                signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
+
+            def __iter__(self):
+                self._fire()
+                return iter(())
+
+            def readline(self, *a):
+                self._fire()
+                return ""
+
+        assert helper.run(Interrupting()) == 0
+        assert helper.services[-1]._shutdown_started
 
 
 class TestQcCoreVersionFlag:

@@ -148,12 +148,15 @@ def sample_file(tmp_dir):
 # parameters, 0.049 s at t=1/m=8 MiB. With well over a thousand such tests
 # that difference is the single largest cost in the suite.
 #
-# Lowering them here is safe for a narrower reason than it first appears:
-# NEITHER format records its KDF parameters (both .qcx and .qcv store only
-# argon_salt — verified), so a container is only openable by code using the
-# same constants. That makes create-then-open self-consistent *within one
-# process*, which is all a test needs, and it is why no committed fixture
-# file may ever be created under these cheap parameters.
+# Since format 2 (.qcx) / 3 (.qcv) a container RECORDS its Argon2 parameters
+# and validate_argon2_params accepts these test-grade values on read, so a
+# container written under pytest opens in production — silently weak.  That
+# is the trap: a fixture-generation script run under pytest would commit a
+# weak file.  TestShippedArgon2Parameters pins the shipped constants and
+# TestFixtureKdfFloor (test_review_run13.py) reads every committed fixture's
+# recorded parameters, so the trap cannot close unnoticed.  (Format-1
+# containers, which record nothing, are only openable by code using the same
+# constants — the reason this comment used to give.)
 # It is also the only knob that does not change what is being tested: no test
 # asserts a derived key against a fixed vector.
 #
@@ -185,8 +188,8 @@ def pytest_configure(config):
     A function-scoped fixture is too late: pytest builds higher-scoped
     fixtures FIRST, so a session- or module-scoped fixture that encrypts
     something did so at the real cost and the test body then tried to open it
-    at the cheap one. Neither container format records its KDF parameters, so
-    that mismatch surfaces as InvalidTag — nine tests failed exactly this way.
+    at the cheap one. Format-1 containers record no KDF parameters, so that
+    mismatch surfaced as InvalidTag — nine tests failed exactly this way.
     """
     for mod in _argon2_targets():
         _REAL_ARGON2.setdefault(

@@ -206,6 +206,40 @@ final class ShareFilesTests: XCTestCase {
         XCTAssertEqual(parsed, [Array(repeating: "apple", count: 50).joined(separator: " ")])
     }
 
+    // MARK: Adjacent mnemonics (F-010)
+
+    /// Two phrases with only a newline between them used to arrive as one
+    /// 100-word run, and the last-50 window kept only the second — "Found 1
+    /// share, but this file needs 2" with no hint the first was dropped.
+    func testTwoPhrasesSeparatedByOneNewlineBothParse() {
+        let first = Array(repeating: "apple", count: 50).joined(separator: " ")
+        let second = Array(repeating: "cabin", count: 50).joined(separator: " ")
+        XCTAssertEqual(ShareFiles.parse(first + "\n" + second + "\n"), [first, second])
+        let third = Array(repeating: "eagle", count: 50).joined(separator: " ")
+        XCTAssertEqual(ShareFiles.parse([first, second, third].joined(separator: "\n")), [first, second, third])
+    }
+
+    /// The same two, each wrapped 8 words per line with no blank line
+    /// between them: still one run, still two phrases.
+    func testTwoWrappedPhrasesWithNoBlankLineBetweenBothParse() {
+        func wrapped(_ word: String) -> String {
+            let words = Array(repeating: word, count: 50)
+            return stride(from: 0, to: 50, by: 8).map {
+                words[$0..<min($0 + 8, 50)].joined(separator: " ")
+            }.joined(separator: "\n")
+        }
+        XCTAssertEqual(ShareFiles.parse(wrapped("apple") + "\n" + wrapped("cabin") + "\n"),
+                       [Array(repeating: "apple", count: 50).joined(separator: " "),
+                        Array(repeating: "cabin", count: 50).joined(separator: " ")])
+    }
+
+    /// A wordy header plus one phrase is 50 + k words, not a multiple of 50,
+    /// so the window rule still applies and the header is not a share.
+    func testAWordyHeaderAndOnePhraseIsStillOnePhrase() {
+        let phrase = Array(repeating: "apple", count: 50).joined(separator: " ")
+        XCTAssertEqual(ShareFiles.parse("keep this file private and safe\n" + phrase + "\n"), [phrase])
+    }
+
     /// Codes and phrases are no longer mutually exclusive: a file holding two
     /// generated shares plus a third one retyped as words yields all three.
     /// The two mnemonics that came with the codes are not repeated — nothing

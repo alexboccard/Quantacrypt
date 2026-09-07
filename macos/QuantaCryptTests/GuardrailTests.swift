@@ -140,7 +140,7 @@ final class GuardrailTests: XCTestCase {
 
     func testAMessagelessHelperErrorStillSaysWhatToDo() {
         let error = CoreError.fromWire(code: "internal", message: nil, detail: nil)
-        XCTAssertFalse(error.message.contains("Something went wrong"))
+        XCTAssertTrue(error.message.contains("didn't say what"), "the fallback names the cause")
         XCTAssertTrue(error.message.contains("Try again"))
     }
 
@@ -284,6 +284,198 @@ final class GuardrailTests: XCTestCase {
         model.createVolume()
         XCTAssertNil(model.createResult)
         model.cancelCreate()
+    }
+
+    // MARK: A chosen mount point belongs to one volume (F-028)
+
+    func testAChosenMountPointDoesNotStickToTheNextVolume() {
+        let model = VolumesModel(core: CoreClient(transportFactory: { FakeTransport() }),
+                                 recents: RecentStore(defaults: Self.scratchDefaults()))
+        XCTAssertTrue(model.prepareMount(path: "/tmp/A.qcv"))
+        model.useMountPoint("/tmp/somewhere-else")
+        XCTAssertEqual(model.mountPoint, "/tmp/somewhere-else")
+        // Retrying the same volume is not a new volume.
+        XCTAssertTrue(model.prepareMount(path: "/tmp/A.qcv"))
+        XCTAssertEqual(model.mountPoint, "/tmp/somewhere-else")
+
+        XCTAssertTrue(model.prepareMount(path: "/tmp/B.qcv"))
+        XCTAssertEqual(model.mountPoint, VolumesModel.defaultMountPoint(for: "/tmp/B.qcv"),
+                       "A's folder would fail as already mounted, or as not empty")
+    }
+
+    // MARK: A read-only mount is shown as one
+
+    func testAReadOnlyMountFlagsTheMountedRow() async throws {
+        let transport = FakeTransport()
+        let model = VolumesModel(core: CoreClient(transportFactory: { transport }),
+                                 recents: RecentStore(defaults: Self.scratchDefaults()))
+        let path = "/tmp/\(UUID().uuidString)/Vault.qcv"
+        model.fuse = FuseCheck(fuseBackend: .init(ok: true, detail: ""), fusepy: .init(ok: true, detail: ""), ok: true)
+        model.mountPath = path
+        model.mountPoint = "/tmp/mnt"
+        model.mountPassword = "hunter2"
+        XCTAssertTrue(model.canMountNow)
+
+        model.mount()
+        await transport.waitForRequests(1)
+        let mount = await transport.request(0)
+        XCTAssertEqual(mount.op, "volume_mount")
+        await transport.emit(["id": mount.id!, "event": "done",
+                              "result": ["mount_point": "/tmp/mnt", "volume_path": path,
+                                         "journal_suspicious": false, "suspect_sidecar": NSNull(),
+                                         "read_only": true]])
+        try await waitUntil("the mount to finish") { model.mountedNote != nil }
+        XCTAssertTrue(model.mountedReadOnly, "the post-mount note must say the drive refuses writes")
+
+        // An older helper's `volume_list` does not carry the flag; the row
+        // must still show it after the poll that follows every mount
+        // replaces the list.
+        await transport.waitForRequests(2)
+        let list = await transport.request(1)
+        XCTAssertEqual(list.op, "volume_list")
+        await transport.emit(["id": list.id!, "event": "done",
+                              "result": ["volumes": [["mount_point": "/tmp/mnt", "volume_path": path,
+                                                      "stats": NSNull()]]]])
+        try await waitUntil("the list to refresh") { !model.mounted.isEmpty }
+        XCTAssertEqual(model.mounted.map(\.readOnly), [true])
+
+        // Unmounting clears the note's flag with the note.
+        model.unmount(model.mounted[0])
+        await transport.waitForRequests(3)
+        let unmount = await transport.request(2)
+        XCTAssertEqual(unmount.op, "volume_unmount")
+        await transport.emit(["id": unmount.id!, "event": "done", "result": ["mount_point": "/tmp/mnt"]])
+        try await waitUntil("the unmount to finish") { model.mountedNote == "Unmounted Vault." }
+        XCTAssertFalse(model.mountedReadOnly)
+        await transport.waitForRequests(4)
+        let relist = await transport.request(3)
+        await transport.emit(["id": relist.id!, "event": "done", "result": ["volumes": []]])
+    }
+
+    func testAWritableMountIsNotFlagged() async throws {
+        let transport = FakeTransport()
+        let model = VolumesModel(core: CoreClient(transportFactory: { transport }),
+                                 recents: RecentStore(defaults: Self.scratchDefaults()))
+        let path = "/tmp/\(UUID().uuidString)/Vault.qcv"
+        model.fuse = FuseCheck(fuseBackend: .init(ok: true, detail: ""), fusepy: .init(ok: true, detail: ""), ok: true)
+        model.mountPath = path
+        model.mountPoint = "/tmp/mnt"
+        model.mountPassword = "hunter2"
+
+        model.mount()
+        await transport.waitForRequests(1)
+        let mount = await transport.request(0)
+        // An older helper: no `read_only` at all.
+        await transport.emit(["id": mount.id!, "event": "done",
+                              "result": ["mount_point": "/tmp/mnt", "volume_path": path, "journal_suspicious": false]])
+        try await waitUntil("the mount to finish") { model.mountedNote != nil }
+        XCTAssertFalse(model.mountedReadOnly)
+        await transport.waitForRequests(2)
+        let list = await transport.request(1)
+        await transport.emit(["id": list.id!, "event": "done",
+                              "result": ["volumes": [["mount_point": "/tmp/mnt", "volume_path": path,
+                                                      "stats": NSNull()]]]])
+        try await waitUntil("the list to refresh") { !model.mounted.isEmpty }
+        XCTAssertEqual(model.mounted.map(\.readOnly), [false])
+    }
+
+    /// The helper now reports `read_only` on every `volume_list` entry, so a
+    /// drive this app never saw the mount result for (cancelled while the
+    /// helper finished anyway, mounted before the app started) is badged
+    /// from the list alone, and the flag survives a later list without the
+    /// key.
+    func testAListedReadOnlyFlagNeedsNoMountResult() async throws {
+        let transport = FakeTransport()
+        let model = VolumesModel(core: CoreClient(transportFactory: { transport }),
+                                 recents: RecentStore(defaults: Self.scratchDefaults()))
+        let path = "/tmp/\(UUID().uuidString)/Vault.qcv"
+
+        let first = Task { await model.refreshMounted() }
+        await transport.waitForRequests(1)
+        let list = await transport.request(0)
+        XCTAssertEqual(list.op, "volume_list")
+        await transport.emit(["id": list.id!, "event": "done",
+                              "result": ["volumes": [["mount_point": "/tmp/mnt", "volume_path": path,
+                                                      "stats": NSNull(), "read_only": true]]]])
+        await first.value
+        XCTAssertEqual(model.mounted.map(\.readOnly), [true])
+        XCTAssertFalse(model.mountedReadOnly, "no mount result was processed, so there is no post-mount note")
+
+        // The list taught the fallback set: a list without the key keeps it.
+        let second = Task { await model.refreshMounted() }
+        await transport.waitForRequests(2)
+        let relist = await transport.request(1)
+        await transport.emit(["id": relist.id!, "event": "done",
+                              "result": ["volumes": [["mount_point": "/tmp/mnt", "volume_path": path,
+                                                      "stats": NSNull()]]]])
+        await second.value
+        XCTAssertEqual(model.mounted.map(\.readOnly), [true])
+    }
+
+    /// The set of read-only mount points is written by mount results and
+    /// used to be corrected only by the next mount result at the same point,
+    /// so a read-only drive replaced by a writable one at the same point
+    /// without the app seeing the second result stayed badged for its
+    /// lifetime. A list entry reporting `read_only: false` must clear the
+    /// row and the set behind it.
+    func testAListedWritableFlagClearsAStaleReadOnlyBadge() async throws {
+        let transport = FakeTransport()
+        let model = VolumesModel(core: CoreClient(transportFactory: { transport }),
+                                 recents: RecentStore(defaults: Self.scratchDefaults()))
+        let path = "/tmp/\(UUID().uuidString)/Vault.qcv"
+        model.fuse = FuseCheck(fuseBackend: .init(ok: true, detail: ""), fusepy: .init(ok: true, detail: ""), ok: true)
+        model.mountPath = path
+        model.mountPoint = "/tmp/mnt"
+        model.mountPassword = "hunter2"
+
+        // A read-only mount result puts /tmp/mnt in the set.
+        model.mount()
+        await transport.waitForRequests(1)
+        let mount = await transport.request(0)
+        await transport.emit(["id": mount.id!, "event": "done",
+                              "result": ["mount_point": "/tmp/mnt", "volume_path": path,
+                                         "journal_suspicious": false, "suspect_sidecar": NSNull(),
+                                         "read_only": true]])
+        try await waitUntil("the mount to finish") { model.mountedNote != nil }
+        XCTAssertTrue(model.mountedReadOnly)
+
+        // By the time the post-mount poll answers, the helper has a writable
+        // drive at that point (a different volume, remounted outside this
+        // model's view); the list is the truth, not the set.
+        let other = "/tmp/\(UUID().uuidString)/Other.qcv"
+        await transport.waitForRequests(2)
+        let list = await transport.request(1)
+        XCTAssertEqual(list.op, "volume_list")
+        await transport.emit(["id": list.id!, "event": "done",
+                              "result": ["volumes": [["mount_point": "/tmp/mnt", "volume_path": other,
+                                                      "stats": NSNull(), "read_only": false]]]])
+        try await waitUntil("the list to refresh") { !model.mounted.isEmpty }
+        XCTAssertEqual(model.mounted.map(\.readOnly), [false])
+
+        // The set was corrected, not just overridden for one poll: a list
+        // without the key no longer revives the badge.
+        let again = Task { await model.refreshMounted() }
+        await transport.waitForRequests(3)
+        let relist = await transport.request(2)
+        await transport.emit(["id": relist.id!, "event": "done",
+                              "result": ["volumes": [["mount_point": "/tmp/mnt", "volume_path": other,
+                                                      "stats": NSNull()]]]])
+        await again.value
+        XCTAssertEqual(model.mounted.map(\.readOnly), [false])
+    }
+
+    // MARK: The suspect sidecar is named (F-003)
+
+    func testASuspiciousMountNamesTheSidecar() {
+        let volume = MountedVolume(mountPoint: "/tmp/mnt", volumePath: "/tmp/Vault.qcv", stats: nil)
+        let named = VolumesModel.suspiciousMountMessage(
+            .init(volume: volume, suspectSidecar: "/tmp/Vault.qcv.suspect-20260905T101500"))
+        XCTAssertTrue(named.contains("saved to Vault.qcv.suspect-20260905T101500 beside the volume"), named)
+        XCTAssertTrue(named.contains("keep a copy of the .qcv"), named)
+        // An older helper sends no sidecar: don't name a file that isn't there.
+        let unnamed = VolumesModel.suspiciousMountMessage(.init(volume: volume, suspectSidecar: nil))
+        XCTAssertFalse(unnamed.contains("saved to"), unnamed)
+        XCTAssertTrue(unnamed.hasPrefix("Vault's records"), unnamed)
     }
 
     // MARK: Helpers

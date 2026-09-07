@@ -18,7 +18,7 @@ final class ShareValidationTests: XCTestCase {
 
     func testMalformedSharesAreNamed() {
         XCTAssertNotNil(ShareValidation.formatProblem("QCSHARE-"))
-        XCTAssertEqual(ShareValidation.formatProblem("qcshare-" + code.dropFirst(8)), "a code starts with QCSHARE- in capitals")
+        XCTAssertNil(ShareValidation.formatProblem("qcshare-" + code.dropFirst(8)), "the prefix is case-insensitive end to end")
         XCTAssertNotNil(ShareValidation.formatProblem("QCSHARE-not base64!"))
         XCTAssertNotNil(ShareValidation.formatProblem("QCSHARE-" + Data("[1,2]".utf8).base64EncodedString()))
         XCTAssertEqual(ShareValidation.formatProblem("apple banana"),

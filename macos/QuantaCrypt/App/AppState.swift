@@ -118,7 +118,7 @@ final class AppState {
 
     func restartHelper() {
         Task {
-            await core.restart()
+            await core.restart(mountedVolumes: volumes.mounted.count)
             await refreshHelperStatus()
         }
     }

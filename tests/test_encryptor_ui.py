@@ -1824,7 +1824,7 @@ class TestOutputPath:
         assert "Scanning folder…" in _widget_texts(app._file_card)
         assert _pump_until(app, lambda: "Scanning folder…" not in _widget_texts(app._file_card), 10)
         line = app._file_card._line2.cget("text")
-        assert line.startswith("3 files  ·  3.0 KB")
+        assert line.startswith("3 files  ·  3.1 KB")
 
     def test_an_unreadable_folder_scans_to_zero(self, mkapp, tmp_path, monkeypatch):
         app = mkapp()
@@ -2580,7 +2580,7 @@ class TestSingleRun:
         assert out.read_bytes().startswith(b"D" * 4096)
         size_texts = [t for t in _widget_texts(app._results) if "decryptor +" in t]
         assert size_texts and size_texts[0].startswith(enc.fmt_size(out.stat().st_size))
-        assert "4.0 KB decryptor" in size_texts[0]
+        assert "4.1 KB decryptor" in size_texts[0]
         assert any("chmod +x out.qcx" in t for t in _widget_texts(app._results))
 
     def test_a_vanished_output_still_produces_a_success_card(self, mkapp, tmp_path):
@@ -2999,7 +2999,7 @@ class TestSuccessCardShares:
         cards = [w for w in app._results.winfo_children() if isinstance(w, ShareCard)]
         assert len(cards) == 3
         assert len(app._pending_shares) == 3
-        assert app._shares_pending == {"__single__"}
+        assert app._shares_pending == {str(out)}
         texts = _widget_texts(app._results)
         assert "Send each person their share. Any 2 of 3 can unlock the file." in texts
         assert "Save individual files →" in texts and "Save combined file" in texts
@@ -3068,13 +3068,13 @@ class TestSaveIndividualShares:
         return app, out, app._pending_shares
 
     def test_cancelling_the_folder_picker_saves_nothing(self, ready, tmp_path, monkeypatch):
-        app, _out, shares = ready
+        app, out, shares = ready
         dlg = _Dialogs(directory="")
         monkeypatch.setattr(enc, "filedialog", dlg)
         app._save_individual_shares(shares, "will.txt")
         assert [c[0] for c in dlg.calls] == ["askdirectory"]
         assert list(tmp_path.glob("*.share-*")) == []
-        assert app._shares_pending == {"__single__"}, "the guard stays armed"
+        assert app._shares_pending == {str(out)}, "the guard stays armed"
         assert "share files saved" not in " ".join(_widget_texts(app._shares_warn))
 
     def test_each_recipient_gets_only_their_own_share(self, ready, tmp_path, monkeypatch):
@@ -3103,7 +3103,7 @@ class TestSaveIndividualShares:
 
     def test_saving_dims_the_cards_and_turns_the_banner_green(
             self, ready, tmp_path, monkeypatch):
-        app, _out, shares = ready
+        app, out, shares = ready
         folder = tmp_path / "to-send"
         folder.mkdir()
         monkeypatch.setattr(enc, "filedialog", _Dialogs(directory=str(folder)))
@@ -3115,7 +3115,7 @@ class TestSaveIndividualShares:
         assert cards and all(c._copy_btn.cget("text") == "✓ Saved" for c in cards)
 
     def test_an_earlier_runs_files_are_never_replaced(self, ready, tmp_path, monkeypatch):
-        app, _out, shares = ready
+        app, out, shares = ready
         folder = tmp_path / "to-send"
         folder.mkdir()
         keeper = folder / "will.share-2-of-3.txt"
@@ -3129,7 +3129,7 @@ class TestSaveIndividualShares:
         assert "The earlier files were left untouched" in note
 
     def test_a_source_with_no_name_still_produces_a_stem(self, ready, tmp_path, monkeypatch):
-        app, _out, shares = ready
+        app, out, shares = ready
         folder = tmp_path / "to-send"
         folder.mkdir()
         monkeypatch.setattr(enc, "filedialog", _Dialogs(directory=str(folder)))
@@ -3139,7 +3139,7 @@ class TestSaveIndividualShares:
     @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
     def test_a_folder_that_refuses_writes_reports_and_stays_pending(
             self, ready, tmp_path, monkeypatch):
-        app, _out, shares = ready
+        app, out, shares = ready
         folder = tmp_path / "readonly"
         folder.mkdir()
         os.chmod(folder, 0o500)
@@ -3153,7 +3153,7 @@ class TestSaveIndividualShares:
         assert boxes.errors and boxes.errors[0][0] == "Save failed"
         assert "Saved 0 of 3 files" in boxes.errors[0][1]
         # Nothing was written, so the shares are still only in this window.
-        assert app._shares_pending == {"__single__"}
+        assert app._shares_pending == {str(out)}
         assert list(folder.iterdir()) == []
         assert app._shares_warn.cget("highlightbackground") == enc.C["warning"]
         assert "share files saved" not in " ".join(_widget_texts(app._shares_warn))
@@ -3165,7 +3165,7 @@ class TestSaveIndividualShares:
         The half that made it stays on disk (deleting a recipient's only key
         would be worse), but the guard must stay armed and the banner must not
         claim the set was saved."""
-        app, _out, shares = ready
+        app, out, shares = ready
         folder = tmp_path / "to-send"
         folder.mkdir()
         real_write = enc.write_new_private_file
@@ -3184,7 +3184,7 @@ class TestSaveIndividualShares:
         assert "No space left" in boxes.errors[0][1]
         assert [p.name for p in folder.iterdir()] == ["will.share-1-of-3.txt"]
         assert shares[0] in (folder / "will.share-1-of-3.txt").read_text()
-        assert app._shares_pending == {"__single__"}
+        assert app._shares_pending == {str(out)}
         assert "share files saved" not in " ".join(_widget_texts(app._shares_warn))
         cards = [w for w in app._results.winfo_children() if isinstance(w, ShareCard)]
         assert cards and all(c._copy_btn.cget("text") == "Copy" for c in cards), \
@@ -3227,7 +3227,7 @@ class TestSaveIndividualShares:
 
     def test_a_name_taken_between_the_probe_and_the_write_is_reported(
             self, ready, tmp_path, monkeypatch):
-        app, _out, shares = ready
+        app, out, shares = ready
         folder = tmp_path / "to-send"
         folder.mkdir()
         taken = [folder / f"will.share-{i}-of-3.txt" for i in (1, 2, 3)]
@@ -3279,13 +3279,13 @@ class TestSaveCombinedShares:
         return app, out, app._pending_shares
 
     def test_cancelling_saves_nothing(self, ready, tmp_path, monkeypatch):
-        app, _out, shares = ready
+        app, out, shares = ready
         dlg = _Dialogs(savename="")
         monkeypatch.setattr(enc, "filedialog", dlg)
         app._save_shares(shares, "will.txt")
         assert [c[0] for c in dlg.calls] == ["asksaveasfilename"]
         assert list(tmp_path.glob("*.shares.txt")) == []
-        assert app._shares_pending == {"__single__"}
+        assert app._shares_pending == {str(out)}
         assert "✓  Shares saved" not in _widget_texts(app._shares_warn)
 
     def test_every_share_and_mnemonic_lands_in_one_private_file(
@@ -3310,7 +3310,7 @@ class TestSaveCombinedShares:
         assert "✓  Shares saved" in _widget_texts(app._shares_warn)
 
     def test_an_existing_file_is_left_alone(self, ready, tmp_path, monkeypatch):
-        app, _out, shares = ready
+        app, out, shares = ready
         target = tmp_path / "will.shares.txt"
         target.write_text("AN EARLIER RUN'S ONLY KEYS")
         monkeypatch.setattr(enc, "filedialog", _Dialogs(savename=str(target)))
@@ -3339,7 +3339,7 @@ class TestSaveCombinedShares:
 
     @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
     def test_a_write_failure_reports_and_stays_pending(self, ready, tmp_path, monkeypatch):
-        app, _out, shares = ready
+        app, out, shares = ready
         folder = tmp_path / "readonly"
         folder.mkdir()
         os.chmod(folder, 0o500)
@@ -3352,7 +3352,7 @@ class TestSaveCombinedShares:
         finally:
             os.chmod(folder, 0o700)
         assert boxes.errors and "have NOT been saved" in boxes.errors[0][1]
-        assert app._shares_pending == {"__single__"}
+        assert app._shares_pending == {str(out)}
 
 
 @requires_tkinter
@@ -3543,26 +3543,22 @@ class TestReset:
         assert app._scroll_job is None
         assert job not in app.tk.call("after", "info")
 
-    def test_an_emptied_share_field_breaks_encrypt_another(self, mkapp, tmp_path):
-        """DEFECT — documented, not fixed.
-
-        _reset reads self._n / self._k directly, so an emptied spinbox raises
-        TclError out of "Encrypt another" and leaves the form half-cleared:
-        the file, password and output are gone while the previous result card
-        is still on screen and the wizard still shows the finished state.
-        Every other reader of those fields (_validate_secret, _do_clamp,
-        _refresh_presets, _secret_ok) catches the empty case — this is the one
-        that does not.
-        """
+    def test_an_emptied_share_field_no_longer_breaks_encrypt_another(self, mkapp, tmp_path):
+        """Was a documented defect: _reset read self._n / self._k directly, so
+        an emptied spinbox raised TclError out of "Encrypt another" and left
+        the form half-cleared with the previous result card still on screen.
+        Run 18 F-204: the read is guarded (see _kn) and happens before
+        anything is cleared."""
         app = mkapp()
         self._used(app, tmp_path)
         app._mode.set("shamir")
         app._n.set("")
-        with pytest.raises(tk.TclError):
-            app._reset()
+        app._reset()                                   # no raise
         assert app._path is None and app._pw1v.get() == ""
-        assert app._results.winfo_children() != [], \
-            "the stale result card is left behind by the aborted reset"
+        assert app._results.winfo_children() == [], "the result card is gone"
+        assert app._kn() is None, "an unparseable field is left for the user to fix"
+        app._n.set(7); app._k.set(4); app._reset()
+        assert app._kn() == (7, 4), "parseable values survive Encrypt another"
 
     def test_reset_survives_a_scroll_job_that_already_fired(self, mkapp):
         app = mkapp()
@@ -3730,7 +3726,7 @@ class TestTestDecrypt:
         monkeypatch.setattr(enc, "messagebox", _Boxes(yes=False))
         app._test_decrypt(str(out))
         assert _alive(app)
-        assert app._shares_pending == {"__single__"}
+        assert app._shares_pending == {str(out)}
 
     def test_an_unreadable_file_reports_instead_of_closing(self, mkapp, tmp_path, monkeypatch):
         app = mkapp(on_close=lambda: None)

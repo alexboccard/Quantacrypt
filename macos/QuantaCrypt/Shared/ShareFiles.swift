@@ -301,11 +301,14 @@ enum ShareFiles {
     /// contents.
     ///
     /// Codes are taken as written. Phrases are gathered from runs of plain
-    /// words, sliding the window like `package.extract_share_codes` does, so a
-    /// mnemonic re-wrapped at 7, 8 or 12 words per line still loads — the old
-    /// exact-50 test threw those away silently, and this is the paper-backup
-    /// recovery path. Case is not evidence either: a word is lower-cased
-    /// before it is tested, as the core does.
+    /// words and cut at the next non-word line: a run that is an exact
+    /// multiple of 50 is consecutive phrases (two pasted with one newline
+    /// between them, or each wrapped 8 per line with no blank line); anything
+    /// else keeps its last 50 words, so a mnemonic re-wrapped at 7, 8 or 12
+    /// words per line under a wordy header still loads — the old exact-50
+    /// test threw those away silently, and this is the paper-backup recovery
+    /// path. Case is not evidence either: a word is lower-cased before it is
+    /// tested, as the core does.
     ///
     /// One deliberate divergence from the core: a phrase is dropped when a
     /// code earlier in the file has not yet been paired with one. Every file
@@ -346,12 +349,23 @@ enum ShareFiles {
 
         func flush() {
             defer { buffer.removeAll() }
-            guard buffer.count == phraseWordCount else { return }
-            if unpairedCodes > 0 {
-                unpairedCodes -= 1
-                return
+            guard buffer.count >= phraseWordCount else { return }
+            // An exact multiple of 50 is adjacent phrases; the last-50 window
+            // used to keep only the second of two pasted a newline apart.
+            // The core splits a run wherever a 50-word candidate passes the
+            // mnemonic checksum; with no wordlist here, the exact-multiple
+            // rule is the deliberate approximation, and a run a wordy header
+            // pushed past 50 (50 + k words) still falls to the window.
+            let runs: [ArraySlice<String>] = buffer.count % phraseWordCount == 0
+                ? stride(from: 0, to: buffer.count, by: phraseWordCount).map { buffer[$0..<$0 + phraseWordCount] }
+                : [buffer.suffix(phraseWordCount)]
+            for run in runs {
+                if unpairedCodes > 0 {
+                    unpairedCodes -= 1
+                    continue
+                }
+                phrases.append(run.joined(separator: " "))
             }
-            phrases.append(buffer.joined(separator: " "))
         }
 
         for line in lines {
@@ -371,9 +385,6 @@ enum ShareFiles {
             }
             if isWordLine {
                 buffer.append(contentsOf: words)
-                // Slide rather than drop: a wrapped mnemonic overshoots 50
-                // mid-line, and the last 50 words are the share.
-                if buffer.count > phraseWordCount { buffer.removeFirst(buffer.count - phraseWordCount) }
             } else {
                 flush()
             }

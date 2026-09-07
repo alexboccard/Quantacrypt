@@ -334,12 +334,29 @@ struct EncryptResult: Decodable, Sendable, Equatable {
     let threshold: Int?
     let total: Int?
     let shares: [Share]?
+    /// Links (and sockets/FIFOs) inside an encrypted folder that the helper
+    /// left out of the archive, by design; the result panel names them so
+    /// the omission is not discovered by the recipient (review F-202).
+    let skippedSymlinks: [String]?
+
+    enum CodingKeys: String, CodingKey {
+        case output, size, filename, mode, threshold, total, shares
+        case skippedSymlinks = "skipped_symlinks"
+    }
+
+    init(output: String, size: Int, filename: String, mode: String,
+         threshold: Int?, total: Int?, shares: [Share]?, skippedSymlinks: [String]? = nil) {
+        self.output = output; self.size = size; self.filename = filename; self.mode = mode
+        self.threshold = threshold; self.total = total; self.shares = shares
+        self.skippedSymlinks = skippedSymlinks
+    }
 
     /// The same result with its key material dropped, for once the shares
     /// are proven saved and working.
     func withoutShares() -> EncryptResult {
         EncryptResult(output: output, size: size, filename: filename, mode: mode,
-                      threshold: threshold, total: total, shares: nil)
+                      threshold: threshold, total: total, shares: nil,
+                      skippedSymlinks: skippedSymlinks)
     }
 }
 
@@ -374,11 +391,35 @@ struct VolumeMountResult: Decodable, Sendable, Equatable {
     let mountPoint: String
     let volumePath: String?
     let journalSuspicious: Bool
+    /// `<vault>.qcv.suspect-<stamp>`, where the helper copied the journal
+    /// tail it could not verify; set only with `journalSuspicious`. Optional
+    /// because an older helper never sent it. A file beside the volume that
+    /// nothing names is the one the user deletes, so the alert names it.
+    let suspectSidecar: String?
+    /// The container or its folder refuses writes, so the helper served the
+    /// drive `-o ro` instead of failing on the first save. Absent from an
+    /// older helper, so it decodes as false when missing rather than making
+    /// the whole result undecodable.
+    let readOnly: Bool
 
     enum CodingKeys: String, CodingKey {
         case mountPoint = "mount_point"
         case volumePath = "volume_path"
         case journalSuspicious = "journal_suspicious"
+        case suspectSidecar = "suspect_sidecar"
+        case readOnly = "read_only"
+    }
+}
+
+extension VolumeMountResult {
+    // In an extension so the memberwise initializer stays available.
+    init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        mountPoint = try c.decode(String.self, forKey: .mountPoint)
+        volumePath = try c.decodeIfPresent(String.self, forKey: .volumePath)
+        journalSuspicious = try c.decode(Bool.self, forKey: .journalSuspicious)
+        suspectSidecar = try c.decodeIfPresent(String.self, forKey: .suspectSidecar)
+        readOnly = try c.decodeIfPresent(Bool.self, forKey: .readOnly) ?? false
     }
 }
 
@@ -402,6 +443,15 @@ struct MountedVolume: Decodable, Sendable, Equatable, Identifiable {
     let mountPoint: String
     let volumePath: String?
     let stats: Stats?
+    /// `read_only` exactly as `volume_list` sent it, nil when the entry had
+    /// no such key. Kept apart from `readOnly` because the model treats a
+    /// reported value as final, and only for nil falls back to the flag it
+    /// remembers from the `volume_mount` result that opened the drive (the
+    /// key is new; an older helper never sends it).
+    let reportedReadOnly: Bool?
+    /// What the row shows: the reported flag, false when the helper sent
+    /// none, until the model stamps it from its fallback.
+    var readOnly: Bool
 
     var id: String { mountPoint }
     var name: String {
@@ -413,6 +463,29 @@ struct MountedVolume: Decodable, Sendable, Equatable, Identifiable {
         case stats
         case mountPoint = "mount_point"
         case volumePath = "volume_path"
+        case readOnly = "read_only"
+    }
+}
+
+extension MountedVolume {
+    /// A row the model builds itself, for the drive a `volume_mount` result
+    /// just opened: nothing was listed, so nothing was reported.
+    init(mountPoint: String, volumePath: String?, stats: Stats?, readOnly: Bool = false) {
+        self.mountPoint = mountPoint
+        self.volumePath = volumePath
+        self.stats = stats
+        self.reportedReadOnly = nil
+        self.readOnly = readOnly
+    }
+
+    // In an extension so the memberwise initializer stays available.
+    init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        mountPoint = try c.decode(String.self, forKey: .mountPoint)
+        volumePath = try c.decodeIfPresent(String.self, forKey: .volumePath)
+        stats = try c.decodeIfPresent(Stats.self, forKey: .stats)
+        reportedReadOnly = try c.decodeIfPresent(Bool.self, forKey: .readOnly)
+        readOnly = reportedReadOnly ?? false
     }
 }
 

@@ -36,6 +36,7 @@ from typing import IO, Callable
 
 import math
 import shamirs
+from argon2.exceptions import HashingError
 from argon2.low_level import hash_secret_raw, Type
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives import hashes
@@ -78,6 +79,11 @@ ARGON2_MIN_MEMORY_COST   = 8            # KiB — argon2's own minimum
 ARGON2_MAX_MEMORY_COST   = 1 << 20      # 1 GiB
 ARGON2_MIN_PARALLELISM   = 1
 ARGON2_MAX_PARALLELISM   = 16
+ARGON2_MIN_SALT_BYTES    = 8            # argon2's own minimum
+
+#: Largest timestamp the name envelope is trusted with: 9999-12-31T23:59:59Z.
+#: Beyond time_t, os.utime raised OverflowError after the plaintext was placed.
+_MAX_TIMESTAMP = 253_402_300_800
 
 # Streaming constants
 # 4 MB plaintext chunks: large enough to amortise GCM overhead, small enough
@@ -115,12 +121,20 @@ def argon2id_derive(password: bytes, salt: bytes,
     """Argon2id over *password* with the shipped parameters, or with the
     (validated) parameters a format-2 container recorded."""
     _reject_empty_secret(password)
+    if len(salt) < ARGON2_MIN_SALT_BYTES:
+        # argon2 rejects it with HashingError — not a ValueError, so a crafted
+        # file read as an app bug instead of as a bad file.
+        raise ValueError("Argon2 salt is too short; the file may be corrupt")
     p = validate_argon2_params(params) if params else argon2_params()
-    return hash_secret_raw(
-        secret=password, salt=salt,
-        time_cost=p["t"], memory_cost=p["m"],
-        parallelism=p["p"], hash_len=KEY_BYTES, type=Type.ID,
-    )
+    try:
+        return hash_secret_raw(
+            secret=password, salt=salt,
+            time_cost=p["t"], memory_cost=p["m"],
+            parallelism=p["p"], hash_len=KEY_BYTES, type=Type.ID,
+        )
+    except HashingError as exc:
+        raise ValueError(f"Argon2 rejected the file's parameters ({exc}); "
+                         "the file may be corrupt") from exc
 
 
 def argon2_params() -> dict:
@@ -147,6 +161,13 @@ def validate_argon2_params(params: object) -> dict:
                 f"{lo}..{hi}). The file may be corrupt or from an unsupported version"
             )
         out[key] = v
+    # argon2 itself needs 8 KiB per lane; a smaller value passes every
+    # per-field bound and then raises from inside the library.
+    if out["m"] < 8 * out["p"]:
+        raise ValueError(
+            f"Argon2 memory cost {out['m']} KiB is below 8 KiB per lane for "
+            f"{out['p']} lanes. The file may be corrupt or from an unsupported version"
+        )
     return out
 
 def expand_kem_ss(kem_ss_raw: bytes) -> bytes:
@@ -248,7 +269,9 @@ def _verify_meta_hmac(key_material: bytes, meta: dict) -> bool:
     Returns True if HMAC is present and valid.
     Raises ValueError if HMAC is absent or invalid (tampering detected)."""
     if "hmac" not in meta:
-        raise ValueError("Metadata HMAC is missing: the file may have been tampered with or is from an unsupported version")
+        # Every format-1 and format-2 writer stores it: absence is tampering,
+        # and "unsupported version" here sent people to update the app.
+        raise ValueError("Metadata HMAC is missing: the file may have been tampered with")
     stored   = meta["hmac"]
     if not isinstance(stored, str):
         raise ValueError("Metadata authentication failed: the file may have been tampered with")
@@ -262,7 +285,7 @@ def validate_kem(name: object) -> str:
     """Return the KEM name a container may use, or raise ``ValueError``."""
     if name is None:
         return KEM_KYBER768
-    if name not in _KEMS:
+    if not isinstance(name, str) or name not in _KEMS:
         raise ValueError(
             f"Unsupported key encapsulation {name!r}. The file may be corrupt "
             "or from a newer version of QuantaCrypt"
@@ -334,17 +357,22 @@ def encode_share(share_dict: dict) -> str:
 
 def decode_share(share_str: str) -> dict:
     s = share_str.strip()
-    if not s.startswith("QCSHARE-"):
+    # The callers route any case of the prefix here (package.py); a
+    # lower-case one used to be refused as "not a share" after they had
+    # already recognised it.
+    if s[:8].upper() != "QCSHARE-":
         raise ValueError("Not a valid QuantaCrypt share")
     try:
         d = json.loads(base64.b64decode(s[8:]).decode())
     except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
         raise ValueError("Share is malformed (could not decode)")
+    if not isinstance(d, dict):
+        raise ValueError("Share is malformed (could not decode)")
     # Validate required fields and types
     for field in ("index", "value", "modulus"):
         if field not in d:
             raise ValueError(f"Share missing required field: {field!r}")
-        if not isinstance(d[field], int):
+        if not isinstance(d[field], int) or isinstance(d[field], bool):
             raise ValueError(f"Share field {field!r} must be an integer, got {type(d[field]).__name__}")
     # Validate modulus matches the known prime — reject any crafted/downgraded modulus
     if d["modulus"] != SHAMIR_PRIME:
@@ -358,6 +386,12 @@ def decode_share(share_str: str) -> dict:
         raise ValueError(f"Share index out of range: {d['index']}")
     if not (0 < d["value"] < SHAMIR_PRIME):
         raise ValueError(f"Share value out of range")
+    # threshold is advisory but shamir_recover compares it with an int; a
+    # string here reached the service as a TypeError ("app bug").
+    if "threshold" in d:
+        t = d["threshold"]
+        if not isinstance(t, int) or isinstance(t, bool) or not (0 <= t <= 255):
+            raise ValueError(f"Share threshold is not a valid count: {t!r}")
     return d
 
 
@@ -796,13 +830,26 @@ def decrypt_streaming(
             "the original file. The file may have been corrupted."
         )
 
-    return inner.get("n", ""), inner.get("sz", 0), inner.get("ts", 0)
+    # The envelope is GCM-sealed, so only the encryptor controls it — but a
+    # .qcx is made to be handed to you, and a non-string name or a timestamp
+    # beyond time_t raised after the plaintext was already placed.
+    name, size, ts = inner.get("n", ""), inner.get("sz", 0), inner.get("ts", 0)
+    if not isinstance(name, str):
+        name = ""
+    if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+        size = 0
+    if (not isinstance(ts, (int, float)) or isinstance(ts, bool)
+            or not (0 <= ts < _MAX_TIMESTAMP)):
+        ts = 0
+    return name, size, ts
 
 
 # ── Mnemonic Encoding (BIP-39 wordlist, 50 words per share) ───────────────────
 # Layout (545 bits total → 50 × 11-bit words):
 #   [521 bits: value] [8 bits: index] [8 bits: threshold] [8 bits: SHA-256 checksum]
-# Value occupies the high bits so the first word draws from the full 2048-word vocabulary.
+# 50 words carry 550 bits for a 545-bit payload: the first word's top five
+# bits are padding, so it is always one of the first 64 words and the
+# decoder rejects any other (the checksum alone cannot see those bits).
 # The M521 modulus is a constant and never stored in the share.
 
 _INDEX_BITS     = 8
@@ -838,23 +885,18 @@ def _int_to_words(n: int, bit_length: int, wordlist: list) -> list:
         result.append(wordlist[(n >> remaining) & 0x7FF])
     return result
 
-def _words_to_int(words: list, bit_length: int, wordlist: list) -> int:
-    index = _wordlist_index()
-    n = 0
-    for w in words:
-        n = (n << 11) | index[w.lower()]
-    return n & ((1 << bit_length) - 1)
-
 def share_to_mnemonic(share_dict: dict) -> str:
     """
     Encode a share dict into a 50-word mnemonic phrase.
     All data (index, threshold, value) is packed with an 8-bit SHA-256 checksum.
     The M521 modulus is not stored — it's a constant recovered at decode time.
 
-    Bit layout (value-first for word diversity):
-      [521 bits: value] [8 bits: index] [8 bits: threshold] [8 bits: checksum]
-    Value occupies the high bits so the first word of the mnemonic is drawn
-    from the full 2048-word BIP-39 vocabulary, not biased toward word 0.
+    Bit layout:
+      [5 bits: zero padding] [521 bits: value] [8 bits: index]
+      [8 bits: threshold] [8 bits: checksum]
+    The padding sits in the first word, which therefore always comes from
+    the first 64 words of the BIP-39 list; mnemonic_to_share rejects a
+    first word outside that range so a typo there is caught like any other.
     """
     wordlist  = _load_wordlist()
     index     = share_dict["index"]
@@ -889,12 +931,25 @@ def mnemonic_to_share(mnemonic: str) -> dict:
     if len(words) != _NUM_WORDS:
         raise ValueError(f"Expected {_NUM_WORDS} words, got {len(words)}")
 
-    # Check all words are valid
-    bad = [w for w in words if w.lower() not in wordlist]
+    # Check all words are valid (hash lookups: a linear scan's duration
+    # depends on the secret word).
+    index = _wordlist_index()
+    bad = [w for w in words if w.lower() not in index]
     if bad:
         raise ValueError(f"Unknown word(s): {', '.join(bad)}")
 
-    full_int = _words_to_int(words, _TOTAL_BITS, wordlist)
+    raw = 0
+    for w in words:
+        raw = (raw << 11) | index[w.lower()]
+    # The five padding bits above the payload must be zero.  Masking them
+    # off silently accepted 31 other first words as the same share — the
+    # one transcription error the checksum could not see.
+    if raw >> _TOTAL_BITS:
+        raise ValueError(
+            "Checksum mismatch: the first word is not one a share can start "
+            "with. The share may have a typo or been corrupted"
+        )
+    full_int = raw & ((1 << _TOTAL_BITS) - 1)
 
     checksum        = full_int & 0xFF
     packed          = full_int >> _CHECKSUM_BITS

@@ -176,10 +176,17 @@ def bind_context_menu(widget):
     and Linux/Windows (Button-3)."""
 
     def _show(event):
-        menu = tk.Menu(widget, tearoff=0,
-                       bg=C["surface2"], fg=C["text"],
-                       activebackground=C["accent"], activeforeground=C["text"],
-                       font=F["caption"], relief="flat", bd=0)
+        # One menu per widget, rebuilt per click: a new tk.Menu on every
+        # right-click lived for the window's lifetime (run 18 F-208).
+        menu = getattr(widget, "_ctx_menu", None)
+        if menu is None or not menu.winfo_exists():
+            menu = tk.Menu(widget, tearoff=0,
+                           bg=C["surface2"], fg=C["text"],
+                           activebackground=C["accent"], activeforeground=C["text"],
+                           font=F["caption"], relief="flat", bd=0)
+            widget._ctx_menu = menu
+        else:
+            menu.delete(0, "end")
         is_text = isinstance(widget, tk.Text)
         has_sel = False
         try:
@@ -529,11 +536,13 @@ def notify(title: str, message: str, sound: bool = True) -> None:
 
 
 def fmt_size(n: int) -> str:
-    """Consistent binary-prefixed file size string used across all size labels."""
-    if n < 1024:           return f"{n:,} B"
-    if n < 1_048_576:      return f"{n/1024:.1f} KB"
-    if n < 1_073_741_824:  return f"{n/1_048_576:.1f} MB"
-    return f"{n/1_073_741_824:.1f} GB"
+    """File size the way Finder and the native shell show it: decimal units.
+    Binary units under SI labels read "4.7 GB" here and "5 GB" there for the
+    same file."""
+    if n < 1000:               return f"{n:,} B"
+    if n < 1_000_000:          return f"{n/1000:.1f} KB"
+    if n < 1_000_000_000:      return f"{n/1_000_000:.1f} MB"
+    return f"{n/1_000_000_000:.1f} GB"
 
 
 from quantacrypt.core.errors import friendly_error  # noqa: E402  (shared vocabulary lives in core)
@@ -1413,6 +1422,25 @@ class ClipboardTimer:
     an account number out of Safari at t=20 is gone at t=60.
     """
     _SECS = 60
+    #: Every timer with a copy still on the clipboard, for wipe_all().
+    _armed: "set[ClipboardTimer]" = set()
+
+    @classmethod
+    def wipe_all(cls):
+        """Clear every armed copy now.  For a quit: the countdown dies with
+        the process, and "the clipboard clears in 60 s" must stay true."""
+        for timer in list(cls._armed):
+            if timer._job is not None:
+                try: timer._root.after_cancel(timer._job)
+                except Exception: pass
+                timer._job = None
+            timer._remain = 0
+            try:
+                timer._wipe()
+            finally:
+                timer._written = None
+                timer._change  = None
+                cls._armed.discard(timer)
 
     def __init__(self, root, label, seconds=60):
         self._root   = root    # any Tk widget with after()/clipboard_clear()
@@ -1440,6 +1468,7 @@ class ClipboardTimer:
         self._change    = change
         self._concealed = concealed
         self._remain = self._secs
+        ClipboardTimer._armed.add(self)
         self._tick()
 
     def _clipboard_text(self):
@@ -1468,6 +1497,7 @@ class ClipboardTimer:
         # Forget the copy too, so a later _clear can never act on a stale one.
         self._written = None
         self._change  = None
+        ClipboardTimer._armed.discard(self)
         try:
             self._set_label("")
         except Exception: pass
@@ -1524,6 +1554,7 @@ class ClipboardTimer:
         # This copy is settled either way; never act on it a second time.
         self._written = None
         self._change  = None
+        ClipboardTimer._armed.discard(self)
         if outcome is True:
             text, fg, fade = f"Clipboard cleared {ICON['ok']}", C["success"], True
         elif outcome is None:
@@ -1615,10 +1646,13 @@ class RecentFiles:
 
     @classmethod
     def _write_raw(cls, entries):
+        """True when the list is on disk.  "Clear" must not report a list of
+        decrypted-file paths gone while it is still stored (run 18 F-208)."""
         try:
             _write_private_json(cls._resolve_path(), entries)
         except Exception:
-            pass
+            return False
+        return True
 
     @staticmethod
     def _well_formed(raw):
@@ -1659,7 +1693,7 @@ class RecentFiles:
 
     @classmethod
     def clear(cls):
-        cls._write_raw([])
+        return cls._write_raw([])
 
 
 class RecentVolumes(RecentFiles):

@@ -290,21 +290,22 @@ class TestPlatformMapping:
 # ── fmt_size ─────────────────────────────────────────────────────────────────
 
 class TestFmtSize:
-    """One size vocabulary for every label: binary prefixes, one decimal."""
+    """One size vocabulary for every label: decimal units, as Finder and the
+    native shell show them (run 13 F-034), one decimal place."""
 
     @pytest.mark.parametrize("n,expected", [
         (0, "0 B"),
         (1, "1 B"),
-        (1023, "1,023 B"),          # last byte before the KB boundary
-        (1024, "1.0 KB"),           # first KB
-        (1_048_575, "1024.0 KB"),   # last byte before the MB boundary
-        (1_048_576, "1.0 MB"),
-        (1_073_741_823, "1024.0 MB"),
-        (1_073_741_824, "1.0 GB"),
-        (5_368_709_120, "5.0 GB"),
-        # GB is the top of the scale on purpose — a terabyte reads as 1024 GB
+        (999, "999 B"),             # last byte before the KB boundary
+        (1000, "1.0 KB"),           # first KB
+        (999_999, "1000.0 KB"),     # last byte before the MB boundary
+        (1_000_000, "1.0 MB"),
+        (999_999_999, "1000.0 MB"),
+        (1_000_000_000, "1.0 GB"),
+        (5_000_000_000, "5.0 GB"),
+        # GB is the top of the scale on purpose — a terabyte reads as 1000 GB
         # rather than growing a unit nobody in this app has a label width for.
-        (1_099_511_627_776, "1024.0 GB"),
+        (1_000_000_000_000, "1000.0 GB"),
     ])
     def test_boundaries(self, n, expected):
         assert fmt_size(n) == expected
@@ -3142,7 +3143,7 @@ class TestFileCard:
         fc.load(str(f))
         tk_root.update()
         assert _texts(fc) == [ICON["ok"], "my report.qcx",
-                              "1.4 MB  ·  Click to change"]
+                              "1.5 MB  ·  Click to change"]
         assert fc._icon.cget("fg") == C["success"]
         assert fc._line1.cget("fg") == C["text"]
         assert fc._line2.cget("fg") == C["accent_text"]
@@ -3168,7 +3169,7 @@ class TestFileCard:
         fc.load_folder(str(tmp_path / "Photos"), 1234, 5_368_709_120)
         tk_root.update()
         assert _texts(fc) == [ICON["ok"], "Photos",
-                              "1,234 files  ·  5.0 GB  ·  Click to change"]
+                              "1,234 files  ·  5.4 GB  ·  Click to change"]
 
     def test_load_folder_while_scanning_says_so(self, tk_root, tmp_path):
         fc, _, _ = self._card(tk_root)
@@ -3893,3 +3894,52 @@ class TestTeardownGuards:
         assert state["error"] is None
         assert tk_root.grab_current() is None, "the grab was not handed back"
         holder.destroy()
+
+
+class TestClipboardWipeAll:
+    """Run 18 F-205: a quit took the countdown with it and left the share on
+    the clipboard."""
+
+    def _timer(self, monkeypatch, on_clipboard):
+        import types
+        from quantacrypt.ui.shared import ClipboardTimer
+        root = types.SimpleNamespace(jobs=[], cleared=0)
+        root.after = lambda ms, fn: root.jobs.append(fn) or len(root.jobs)
+        root.after_cancel = lambda job: None
+        root.clipboard_clear = lambda: setattr(root, "cleared", root.cleared + 1)
+        t = ClipboardTimer(root, None, seconds=60)
+        monkeypatch.setattr(t, "_clipboard_text", lambda: on_clipboard)
+        return t, root
+
+    def test_wipe_all_clears_only_the_copies_still_ours(self, monkeypatch):
+        from quantacrypt.ui.shared import ClipboardTimer
+        ClipboardTimer._armed.clear()
+        ours, root_a = self._timer(monkeypatch, "share-one")
+        theirs, root_b = self._timer(monkeypatch, "an account number")
+        ours.start("share-one", concealed=True); theirs.start("share-two", concealed=True)
+        assert ClipboardTimer._armed == {ours, theirs}
+        ClipboardTimer.wipe_all()
+        assert root_a.cleared == 1 and root_b.cleared == 0          # theirs changed meanwhile
+        assert ClipboardTimer._armed == set() and ours._written is None and ours._job is None
+
+    def test_cancel_and_the_countdown_disarm(self, monkeypatch):
+        from quantacrypt.ui.shared import ClipboardTimer
+        ClipboardTimer._armed.clear()
+        t, root = self._timer(monkeypatch, "x")
+        t.start("x"); assert t in ClipboardTimer._armed
+        t.cancel();   assert t not in ClipboardTimer._armed
+        t.start("x"); t._remain = 0; t._tick()
+        assert t not in ClipboardTimer._armed and root.cleared == 1
+
+
+class TestRecentFilesClearReportsFailure:
+    def test_clear_is_false_when_the_list_cannot_be_rewritten(self, monkeypatch, tmp_path):
+        """Run 18 F-208: "Clear" removed the rows and left the stored list of
+        decrypted-file paths on disk."""
+        from quantacrypt.ui import shared
+        monkeypatch.setattr(shared.RecentFiles, "_resolve_path", classmethod(lambda cls: str(tmp_path / "recent.json")))
+        assert shared.RecentFiles.clear() is True
+        def refuse(path, entries):
+            raise PermissionError(13, "Permission denied", path)
+        monkeypatch.setattr(shared, "_write_private_json", refuse)
+        assert shared.RecentFiles.clear() is False

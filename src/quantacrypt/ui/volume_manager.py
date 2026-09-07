@@ -199,25 +199,41 @@ class VolumeManagerApp(tk.Toplevel):
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
+    def commit_quit(self) -> None:
+        """State changes deferred out of ``can_quit()`` until the quit is
+        certain: cancel a running worker so it tears its partial file down."""
+        if self._busy:
+            self._cancel_event.set()
+
     def _close(self):
+        if not self.can_quit():
+            return
+        self.commit_quit()
+        self._cancel_jobs()
+        self.destroy()
+        if self._on_close:
+            self._on_close()
+
+    def can_quit(self) -> bool:
+        """Whether this window consents to closing — a pure predicate that
+        changes no state, so a later window's veto (``_register_quit`` asks
+        every window, then the launcher) cannot leave a job already
+        cancelled behind a quit that did not happen (review run 20 F-005).
+        The cancel is taken in ``commit_quit()`` once the quit is certain."""
         if self._busy:
             if self._busy_what == "create":
-                ok = confirm(
+                return confirm(
                     self, "Creation is still running",
-                    "Closing now cancels it. The unfinished volume file is "
-                    "deleted as soon as the current step finishes.",
-                    yes="Cancel and close", no="Keep working", danger=True)
-            else:
-                ok = confirm(
-                    self, "Mounting is still running",
-                    "A mount can't be interrupted. If it succeeds, the volume "
-                    "will be listed under Mounted Volumes next time you open "
-                    "this window.",
-                    yes="Close anyway", no="Keep working", danger=True)
-            if not ok:
-                return
-            self._cancel_event.set()
-        elif self._pending_shares:
+                    "Quitting now abandons it. A partial, unusable volume file "
+                    "may be left in the destination folder; delete it by hand.",
+                    yes="Abandon and quit", no="Keep working", danger=True)
+            return confirm(
+                self, "Mounting is still running",
+                "A mount can't be interrupted. Quitting now abandons it; if it "
+                "had already succeeded the drive stays mounted until you eject "
+                "it in Finder.",
+                yes="Quit anyway", no="Keep working", danger=True)
+        if self._pending_shares:
             # The shares dialog is up (or was reached around) — these are
             # the only way the new volume will ever open.
             if not confirm(self, "Shares not saved",
@@ -225,17 +241,14 @@ class VolumeManagerApp(tk.Toplevel):
                            "haven't been saved. Closing this window throws them "
                            "away and the volume can never be opened.",
                            yes="Discard shares", no="Go back", danger=True):
-                return
-        elif self._has_typed_input():
+                return False
+        if self._has_typed_input():
             if not confirm(self, "Discard what you typed?",
                            "Your password or shares haven't been used yet. "
                            "Closing this window throws them away.",
                            yes="Discard", no="Keep editing", danger=True):
-                return
-        self._cancel_jobs()
-        self.destroy()
-        if self._on_close:
-            self._on_close()
+                return False
+        return True
 
     def _has_typed_input(self) -> bool:
         """A password or shares typed on either panel and not yet used."""
@@ -513,7 +526,7 @@ class VolumeManagerApp(tk.Toplevel):
         if self._busy:
             return
         self._err.config(text="")
-        path = self._loc_var.get().strip()
+        path = os.path.expanduser(self._loc_var.get().strip())
         if not path:
             self._fail_create("Choose where to save the volume.", self._loc_entry)
             return
@@ -1042,11 +1055,12 @@ class VolumeManagerApp(tk.Toplevel):
 
         if sys.platform == "darwin":
             if shutil.which("brew"):
-                cmd = "brew install --cask fuse-t"
+                from quantacrypt.core.fuse_ops import FUSE_INSTALL_ALT, FUSE_INSTALL_CMD
+                cmd = FUSE_INSTALL_CMD
                 widgets["detail_lbl"].config(
                     text="Needs an administrator password. FUSE-T is recommended "
-                         "(no kernel extension); macFUSE also works: "
-                         "brew install --cask macfuse", fg=C["text3"])
+                         f"(no kernel extension); macFUSE also works: {FUSE_INSTALL_ALT}",
+                    fg=C["text3"])
                 self._set_cmd_box(box, cmd)
                 box.pack(fill="x", pady=(SP["s"], 0))
 
@@ -1276,14 +1290,14 @@ class VolumeManagerApp(tk.Toplevel):
 
         try:
             _header, auth_params = vol.read_volume_auth_params(path)
-        except (ValueError, OSError):
+        except (ValueError, OSError, TypeError):
             if show_errors:
                 self._vol_info_lbl.config(text="Not a valid .qcv file", fg=C["error"])
             else:
                 self._vol_info_lbl.config(text="")
             return
 
-        mode = auth_params.get("mode", "single")
+        mode = auth_params["mode"]        # required by read_volume_auth_params
         try:
             size_hint = f"  ·  file on disk {fmt_size(os.path.getsize(path))}"
         except OSError:
@@ -1389,8 +1403,8 @@ class VolumeManagerApp(tk.Toplevel):
         if self._busy:
             return
         self._mount_err.config(text="")
-        vol_path = self._mount_path_var.get().strip()
-        mount_point = self._mount_point_var.get().strip()
+        vol_path = os.path.expanduser(self._mount_path_var.get().strip())
+        mount_point = os.path.expanduser(self._mount_point_var.get().strip())
 
         if not vol_path or not os.path.isfile(vol_path):
             self._fail_mount("Select a valid .qcv file.", self._mount_path_entry)
@@ -1432,7 +1446,7 @@ class VolumeManagerApp(tk.Toplevel):
             try:
                 # Read unencrypted auth params (no key needed)
                 header, auth_params = vol.read_volume_auth_params(vol_path)
-                mode = auth_params.get("mode", "single")
+                mode = auth_params["mode"]    # required by read_volume_auth_params
 
                 _stage(1)
                 if mode == "single":
@@ -1459,11 +1473,17 @@ class VolumeManagerApp(tk.Toplevel):
                 # Mount via FUSE (mount_volume opens the volume internally)
                 _stage(2)
                 from quantacrypt.core.fuse_ops import mount_volume
-                fuse_obj = mount_volume(vol_path, final_key, mount_point)
+                # The key came out of this volume's own auth block, so a
+                # metadata failure inside open() is tampering, not a typo.
+                fuse_obj = mount_volume(vol_path, final_key, mount_point,
+                                        credential_proven=True)
 
                 suspicious = fuse_obj.volume.journal_suspicious
+                sidecar = getattr(fuse_obj.volume, "suspect_sidecar", None)
+                read_only = bool(getattr(fuse_obj.volume, "read_only", False))
                 self._after(lambda: self._on_mount_done(
-                    vol_path, mount_point, auth_params, suspicious=suspicious))
+                    vol_path, mount_point, auth_params, suspicious=suspicious,
+                    sidecar=sidecar, read_only=read_only))
 
             except Exception as e:
                 self._after(lambda exc=e: self._mount_error(exc, mount_point))
@@ -1476,14 +1496,22 @@ class VolumeManagerApp(tk.Toplevel):
         self._mount_btn.enable(True)
 
     def _on_mount_done(self, vol_path: str, mount_point: str, auth_params: dict,
-                       suspicious: bool = False):
+                       suspicious: bool = False, sidecar: str | None = None,
+                       read_only: bool = False):
         self._mount_prog.complete()
         self._after(lambda: self._mount_prog.pack_forget(), 1200)
         self._end_mount_busy()
         self._mount_pw_var.set("")
         self._mount_shares_text.delete("1.0", "end")
         RecentVolumes.add(vol_path, auth_params)
-        self._set_status(f"{ICON['ok']} Mounted at {mount_point}", C["success"])
+        if read_only:
+            # The container or its folder refuses writes (read-only media,
+            # a locked share): say so before the first failed copy does.
+            self._set_status(
+                f"{ICON['ok']} Mounted read-only at {mount_point} — the .qcv "
+                "file or its folder can't be written", C["warning"])
+        else:
+            self._set_status(f"{ICON['ok']} Mounted at {mount_point}", C["success"])
         self._refresh_mounted_list(force=True)
         if not suspicious:
             notify("Volume Mounted", f"Encrypted volume mounted at {mount_point}")
@@ -1493,11 +1521,18 @@ class VolumeManagerApp(tk.Toplevel):
         # a crash.  Warn BEFORE the user writes: the first save
         # truncates the suspicious tail, destroying the evidence.
         name = os.path.basename(vol_path)
+        # The unreadable tail was copied beside the volume before the first
+        # save overwrites it.  Evidence nobody is told about is
+        # indistinguishable from litter, so name the file.
+        kept = (f"The unreadable records were saved to {os.path.basename(sidecar)} "
+                "beside the volume; keep it with your backup if you want to "
+                "look into this.\n\n") if sidecar else ""
         if confirm(
                 self, "This volume may have been altered",
                 f"{name}'s records don't match what QuantaCrypt last wrote. "
-                "it may have been altered or swapped for an older copy. It was "
+                "It may have been altered or swapped for an older copy. It was "
                 "mounted using the last state that checks out.\n\n"
+                f"{kept}"
                 "If you didn't expect this, unmount now and keep a copy of the "
                 ".qcv file before writing anything.",
                 yes="Unmount now", no="Keep mounted", danger=True):
@@ -1565,6 +1600,14 @@ class VolumeManagerApp(tk.Toplevel):
         if err is None:
             self._set_status(f"{ICON['ok']} Unmounted {name}", C["success"])
             self._empty_note = f"Unmounted {name}."
+            self._refresh_mounted_list(force=True)
+            return
+        from quantacrypt.core.errors import InvalidInput
+        if isinstance(err, InvalidInput):
+            # Already ejected out from under us (an external umount between
+            # the poll and the click): not an error to alert on.
+            self._set_status(f"{ICON['ok']} {name} was already unmounted", C["success"])
+            self._empty_note = f"{name} was already unmounted."
             self._refresh_mounted_list(force=True)
             return
         detail = friendly_error(err)
@@ -1693,6 +1736,11 @@ class VolumeManagerApp(tk.Toplevel):
                      bg=C["surface"], fg=C["text"]).pack(anchor="w")
             tk.Label(names, text=mp, font=F["caption"],
                      bg=C["surface"], fg=C["text3"]).pack(anchor="w")
+            if info.get("read_only"):
+                # The one-shot status line is overwritten by the next
+                # action; the row is what the user looks at before dragging.
+                tk.Label(names, text="Read-only — the .qcv file or its folder can't be written",
+                         font=F["caption"], bg=C["surface"], fg=C["warning"]).pack(anchor="w")
 
             btn_frame = tk.Frame(top, bg=C["surface"])
             btn_frame.pack(side="right")

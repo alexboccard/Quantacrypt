@@ -47,7 +47,7 @@ targets:
         CFBundleDisplayName: QuantaCrypt
         CFBundleShortVersionString: "1.4.0"
         CFBundleIconFile: icon
-        CFBundleVersion: "1"
+        CFBundleVersion: "1.4.0"
         LSMinimumSystemVersion: "$(MACOSX_DEPLOYMENT_TARGET)"
         LSApplicationCategoryType: public.app-category.utilities
         NSHumanReadableCopyright: "Copyright © 2026 Alex Boccard. All rights reserved."

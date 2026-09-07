@@ -26,10 +26,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return .terminateCancel
         }
         let core = state.core
+        // The Volumes screen's last poll: what the helper has to unmount, and
+        // so how long its answer may take. Stale on the high side is fine.
+        let mounted = state.volumes.mounted.count
         Task {
             // The helper cancels work and unmounts every volume before it
             // answers; its answer names any mount point it could not release.
-            let outcome = await core.shutdown()
+            let outcome = await core.shutdown(mountedVolumes: mounted)
             if !outcome.unmountFailed.isEmpty {
                 Self.showUnmountFailures(outcome.unmountFailed)
             }

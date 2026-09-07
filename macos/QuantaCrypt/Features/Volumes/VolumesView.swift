@@ -65,19 +65,13 @@ struct VolumesView: View {
             Text("Anything still open from \(Format.tildePath(volume.mountPoint)) may lose unsaved work.")
         }
         .alert("This volume may have been altered",
-               isPresented: Binding(get: { model.suspiciousVolume != nil },
-                                    set: { if !$0 { model.suspiciousVolume = nil } }),
-               presenting: model.suspiciousVolume) { volume in
-            Button("Unmount now", role: .destructive) { model.unmount(volume) }
+               isPresented: Binding(get: { model.suspiciousMount != nil },
+                                    set: { if !$0 { model.suspiciousMount = nil } }),
+               presenting: model.suspiciousMount) { mount in
+            Button("Unmount now", role: .destructive) { model.unmount(mount.volume) }
             Button("Keep mounted", role: .cancel) {}
-        } message: { volume in
-            // "Unmounting now keeps it untouched" was an unconditional promise
-            // about a conditional guarantee: the container is safe only until
-            // something writes, and macOS puts .DS_Store and Spotlight
-            // metadata on a fresh mount within seconds — the first save then
-            // truncates the suspicious tail for good. This matches the Tk
-            // wording, which tells the user to keep a copy first.
-            Text("\(volume.name)'s records don't match what QuantaCrypt last wrote. It may have been altered or swapped for an older copy. It was mounted using the last state that checks out.\n\nIf you didn't expect this, unmount now and keep a copy of the .qcv file before writing anything: macOS writes to a new drive within seconds, and the first write destroys the records that raised this.")
+        } message: { mount in
+            Text(VolumesModel.suspiciousMountMessage(mount))
         }
     }
 
@@ -340,10 +334,15 @@ struct VolumesView: View {
             if let note = model.mountedNote {
                 Label(note, systemImage: "checkmark.circle.fill")
                     .foregroundStyle(.green)
-                Text("Drag files onto the drive in Finder to add them. They are encrypted as they are written, and sealed back into the volume file when you unmount.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                if model.mountedReadOnly {
+                    // Not the drag-in hint: Finder would refuse the drop.
+                    WarningStrip(text: VolumesModel.readOnlyMountMessage)
+                } else {
+                    Text("Drag files onto the drive in Finder to add them. They are encrypted as they are written, and sealed back into the volume file when you unmount.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
         }
     }
@@ -369,8 +368,19 @@ struct VolumesView: View {
                 HStack {
                     Label {
                         VStack(alignment: .leading, spacing: 2) {
-                            Text(volume.name)
-                                .font(.body.weight(.medium))
+                            HStack(spacing: 6) {
+                                Text(volume.name)
+                                    .font(.body.weight(.medium))
+                                if volume.readOnly {
+                                    // Same amber as WarningStrip: a drive that
+                                    // refuses writes is a condition to know
+                                    // about before dragging anything onto it.
+                                    Label("Read-only", systemImage: "lock")
+                                        .font(.callout)
+                                        .foregroundStyle(.orange)
+                                        .help(VolumesModel.readOnlyMountMessage)
+                                }
+                            }
                             Text(volumeDetail(volume))
                                 .font(.callout)
                                 .foregroundStyle(.secondary)

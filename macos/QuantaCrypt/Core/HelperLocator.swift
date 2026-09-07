@@ -14,7 +14,9 @@ import Security
 /// Settings, in this session.
 enum HelperLocator {
     static let overrideDefaultsKey = "helperPathOverride"
+    #if DEBUG
     static let devVenv = "/Users/xelaboc/Projects/Quantacrypt/.venv"
+    #endif
 
     /// What a helper's code signature is checked against.
     ///
@@ -124,7 +126,15 @@ enum HelperLocator {
         if let override = override?.trimmingCharacters(in: .whitespacesAndNewlines), !override.isEmpty {
             let path = (override as NSString).expandingTildeInPath
             searched.append("Settings override: \(path)")
-            if executable(path) {
+            if isDirectory(path, fileManager) {
+                // `isExecutableFile` is true for any searchable folder, so
+                // `~/Downloads/qc-core.app` — the bundle, not its Mach-O —
+                // passed, was signature-checked as a bundle, could be
+                // approved, and then failed opaquely in `Process.run()`.
+                let denial = directoryRefusal(URL(fileURLWithPath: path))
+                refusal = denial
+                searched.append("Refused: \(denial.reason)")
+            } else if executable(path) {
                 let url = URL(fileURLWithPath: path)
                 let status = signature(url)
                 if let denial = overrideRefusal(url, status: status, bundle: bundle, approved: approved) {
@@ -254,6 +264,22 @@ enum HelperLocator {
                            reason: "\(path) is outside QuantaCrypt, and every password and share you type goes to it. It stays unused until you approve it here.",
                            approvable: true)
         }
+    }
+
+    /// A folder cannot be `exec`ed, approved or not. When it is a bundle —
+    /// `dist/qc-core.app` from `build.py --helper` is the likely one — the
+    /// sentence names the executable inside, which is what the override
+    /// should point at.
+    static func directoryRefusal(_ url: URL) -> Refusal {
+        let path = url.standardizedFileURL.path
+        if let executable = Bundle(url: url)?.executableURL?.standardizedFileURL.path {
+            return Refusal(path: path,
+                           reason: "\(path) is an app bundle, not the helper itself. It stays unused. Set the path above to \(executable), or clear it to use the bundled helper.",
+                           approvable: false)
+        }
+        return Refusal(path: path,
+                       reason: "\(path) is a folder, not the qc-core executable. It stays unused. Clear the path above to use the bundled helper.",
+                       approvable: false)
     }
 
     /// Why a helper *inside* the app bundle may not be launched, or nil when

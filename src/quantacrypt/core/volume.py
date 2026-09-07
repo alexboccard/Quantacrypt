@@ -69,6 +69,11 @@ from quantacrypt.core.crypto import (
 )
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+#: Bound at import: __del__ may run after the os module was torn down.
+_os_close = os.close
+
+from quantacrypt.core.errors import CorruptPayload
+
 logger = logging.getLogger(__name__)
 
 # ── Volume constants ────────────────────────────────────────────────────────
@@ -252,7 +257,39 @@ def _read_auth_params(f: IO[bytes]) -> dict:
     validate_kem(auth.get("kem"))
     if "argon2" in auth:
         validate_argon2_params(auth["argon2"])
+    # The mode and share counts decide which prompt the UIs show and how
+    # many shares op_volume_mount waits for; an unknown mode or a string
+    # threshold turned a split-key volume into a password prompt and a
+    # TypeError deep in the service instead of "this file is corrupt".
+    # Every writer since the first volume commit has put "mode" in the
+    # block, so a missing one is corruption or an edit — and defaulting it
+    # to "single" is what turned a split-key volume into a password prompt.
+    # Say so before any credential is asked for.
+    if "mode" not in auth:
+        raise ValueError("Volume auth params do not name a mode; "
+                         "the file may be corrupt or tampered with")
+    mode = auth["mode"]
+    if mode not in ("single", "shamir"):
+        raise ValueError(f"Volume auth params name an unknown mode {mode!r}; "
+                         "the file may be corrupt or tampered with")
+    if mode == "shamir":
+        for key in ("threshold", "total"):
+            v = auth.get(key)
+            if not isinstance(v, int) or isinstance(v, bool):
+                raise ValueError(f"Volume auth params field {key!r} is not a number; "
+                                 "the file may be corrupt or tampered with")
+        # Same floor as shamir_split and the .qcx reader: one share alone is
+        # not a threshold, and recovering from one computes garbage.
+        if not (2 <= auth["threshold"] <= auth["total"] <= 255):
+            raise ValueError("Volume auth params carry invalid share counts; "
+                             "the file may be corrupt or tampered with")
     return auth
+
+
+#: Every field the cleartext block may carry.  Each also lives in the sealed
+#: metadata; open() requires a sealed one to be present in the block too.
+_AUTH_VOCABULARY = ("mode", "threshold", "total", "kem", "argon2", "argon_salt",
+                    "kyber_kem_ct", "kyber_sk_enc_nonce", "kyber_sk_enc")
 
 
 def read_volume_auth_params(path: str) -> tuple[dict, dict]:
@@ -539,7 +576,7 @@ def derive_volume_key_single(password: str, meta: dict) -> bytes:
     kem = validate_kem(meta.get("kem"))
     argon_key = argon2id_derive(password.encode(), d64("argon_salt"), meta.get("argon2"))
     sk = aes_gcm_decrypt(argon_key, d64("kyber_sk_enc_nonce"), d64("kyber_sk_enc"))
-    kem_ss = kyber_decaps(sk, d64("kyber_kem_ct"), kem)
+    kem_ss = _decaps_proven(sk, d64("kyber_kem_ct"), kem)
     return xor_bytes(argon_key, kem_ss)
 
 
@@ -555,8 +592,25 @@ def derive_volume_key_shamir(share_strings: list[str], meta: dict) -> bytes:
     share_dicts = [decode_share(s) for s in share_strings]
     master_key = shamir_recover(share_dicts)
     sk = aes_gcm_decrypt(master_key, d64("kyber_sk_enc_nonce"), d64("kyber_sk_enc"))
-    kem_ss = kyber_decaps(sk, d64("kyber_kem_ct"), kem)
+    kem_ss = _decaps_proven(sk, d64("kyber_kem_ct"), kem)
     return xor_bytes(master_key, kem_ss)
+
+
+def _decaps_proven(sk: bytes, kem_ct: bytes, kem: str) -> bytes:
+    """Decapsulate after the KEM private key has unsealed.
+
+    Unsealing ``kyber_sk_enc`` is the credential proof: a wrong password or
+    share set fails there.  A failure past it — a ciphertext of the wrong
+    length, the other KEM's name — is tampering or damage, and must not be
+    reported as a wrong password.
+    """
+    try:
+        return kyber_decaps(sk, kem_ct, kem)
+    except Exception as exc:
+        raise CorruptPayload(
+            "The password or shares are right, but this volume's key data was "
+            "tampered with or damaged after it was created. It cannot be "
+            "opened; restore it from a backup.") from exc
 
 
 # ── Volume creation ─────────────────────────────────────────────────────────
@@ -776,6 +830,11 @@ class VolumeContainer:
     updated directory index back to disk.
     """
 
+    #: Set by mount_volume() when the container or its directory refuses
+    #: writes.  The FUSE layer refuses every mutation before touching state,
+    #: so nothing here ever tries to save.
+    read_only: bool = False
+
     def __init__(self, path: str, final_key: bytes):
         self.path = path
         self.final_key = final_key
@@ -826,6 +885,17 @@ class VolumeContainer:
         # compact() replaces the inode, so it drops the descriptor.
         self._reader_fd: int | None = None
         self._reader_lock = threading.Lock()
+        # True once this session has appended records into the pinned inode
+        # (gates the orphaned-inode rescue); a sidecar path once one was
+        # written (makes the rescue idempotent).
+        self._appended_since_open = False
+        self._stale_sidecar: str | None = None
+        # Guards the check-and-claim of _stale_sidecar so two tear-down
+        # rescues (one under the FUSE _lock, one on the lock-free signal
+        # path) cannot both create a sidecar across a wall-clock second
+        # boundary (review run 22 F-002).  Held only around the O_EXCL
+        # reservation, never the copy.
+        self._stale_lock = threading.Lock()
 
     def close(self) -> None:
         """Release the read descriptor.  Safe to call more than once."""
@@ -833,12 +903,58 @@ class VolumeContainer:
             fd, self._reader_fd = self._reader_fd, None
         if fd is not None:
             try:
-                os.close(fd)
+                _os_close(fd)
             except OSError:
                 pass
 
     def __del__(self):
-        self.close()
+        # Every opened container now holds a descriptor for its whole life
+        # (the pinned reader); at interpreter teardown module globals are
+        # already None, hence the bound primitive and the broad guard.
+        try:
+            self.close()
+        except (AttributeError, TypeError, OSError):
+            pass
+
+    def discard_unsaved(self) -> None:
+        """Drop every unsaved change and re-read the index from disk.
+
+        For a mount that lost writability: the change that hit the failure
+        is reported to the caller, and nothing in memory may keep serving
+        it (a phantom directory, bytes that vanish at the next mount).
+
+        The fresh state is built on the side and adopted only if the re-open
+        succeeds: a re-open that raises (the same permission change removed
+        read as well as write) must leave memory exactly as it was, not
+        half-cleared with a phantom entry whose blob is already gone
+        (review run 20 F-101).
+        """
+        fresh = VolumeContainer(self.path, self.final_key)
+        fresh.open(credential_proven=True)          # may raise — memory untouched
+        self.dir_index = fresh.dir_index
+        self.metadata = fresh.metadata
+        self.header = fresh.header
+        self._data_offset = fresh._data_offset
+        self._file_size = fresh._file_size
+        self._baseline_size = fresh._baseline_size
+        self._journal_start = fresh._journal_start
+        self._journal_end = fresh._journal_end
+        self._journal_records = fresh._journal_records
+        self.journal_suspicious = fresh.journal_suspicious
+        self.suspect_sidecar = fresh.suspect_sidecar
+        with self._reader_lock:
+            old_fd, self._reader_fd = self._reader_fd, fresh._reader_fd
+        with fresh._reader_lock:
+            fresh._reader_fd = None
+        if old_fd is not None:
+            try:
+                _os_close(old_fd)
+            except OSError:
+                pass
+        self._pending_ops.clear()
+        self._file_data.clear()
+        self._dirty = False
+        self._appended_since_open = False
 
     def _pread(self, offset: int, length: int) -> bytes:
         """Read *length* bytes at absolute *offset* of the container."""
@@ -857,7 +973,7 @@ class VolumeContainer:
             remaining -= len(chunk)
         return parts[0] if len(parts) == 1 else b"".join(parts)
 
-    def open(self) -> None:
+    def open(self, credential_proven: bool = False) -> None:
         """Read and decrypt the volume header, metadata, and directory.
 
         File data blobs are NOT read eagerly — they're loaded on demand by
@@ -885,6 +1001,16 @@ class VolumeContainer:
                 self.final_key, self.header["meta_nonce"], meta_ct
             )
         except Exception as exc:
+            if credential_proven:
+                # The key came out of this container's own auth block (the
+                # caller derived it and the KEM private key unsealed), so
+                # the password/shares are right: only the sealed metadata or
+                # the header nonce it was sealed under can be wrong.
+                raise CorruptPayload(
+                    "The password or shares are right, but this volume's "
+                    "metadata was tampered with or damaged after it was "
+                    "created. It cannot be opened; restore it from a backup."
+                ) from exc
             raise ValueError(
                 "Could not decrypt volume metadata. "
                 "The password or key may be incorrect, "
@@ -908,6 +1034,27 @@ class VolumeContainer:
                     f"Volume auth params field {k!r} does not match the sealed "
                     "metadata: the volume file has been tampered with"
                 )
+        # A key *removed* from the block escapes the loop above, and a
+        # removed "mode"/"threshold" turned a split-key volume into a
+        # password prompt: every sealed auth field must still be there.
+        for k in _AUTH_VOCABULARY:
+            if k in self.metadata and k not in self.auth_params:
+                raise ValueError(
+                    f"Volume auth params field {k!r} was removed from the "
+                    "cleartext block: the volume file has been tampered with"
+                )
+        # The 4-byte header version sits outside both the sealed metadata
+        # and the cleartext block.  Rewriting it 3→2 opened fine, and the
+        # next compact() wrote a "v2" container whose auth block still named
+        # an ML-KEM ciphertext — an older release then reported a wrong
+        # password.  (Binding the header as AAD waits for a format bump.)
+        sealed_version = self.metadata.get("format_version")
+        if sealed_version is not None and sealed_version != self.header["version"]:
+            raise ValueError(
+                f"Volume header says format {self.header['version']} but the "
+                f"sealed metadata says {sealed_version}: the volume file has "
+                "been tampered with"
+            )
 
         try:
             self.dir_index = decrypt_directory(
@@ -918,6 +1065,16 @@ class VolumeContainer:
                 "Could not decrypt volume directory index. "
                 "The volume file may be corrupt"
             ) from exc
+
+        # Pin the inode this index describes now, not at the first read: a
+        # read-only mount beside a writer whose compact() replaced the file
+        # would otherwise open the new inode against the old offsets and
+        # fail every read.  A pinned reader serves a consistent snapshot;
+        # compact() in this process drops it via close() before rewriting.
+        with self._reader_lock:
+            if self._reader_fd is None:
+                self._reader_fd = os.open(self.path, os.O_RDONLY)
+        self._appended_since_open = False
 
         # Validate directory index keys: reject absolute-escape, traversal,
         # and non-absolute entries that an attacker could inject by tampering
@@ -1355,21 +1512,35 @@ class VolumeContainer:
         rel = offset - first * chunk_size
         return plain[rel:rel + (end - offset)]
 
-    def write_file(self, vpath: str, data: bytes) -> None:
+    def write_file(self, vpath: str, data: bytes, *,
+                   mtime: float | None = None, mode: int | None = None) -> None:
         """Encrypt and store file data in the volume.
 
         The blob lives in _file_data until the next save(), which will
         append it to the journal region of the container (format v2+).
+        ``mtime`` lets the FUSE layer keep a timestamp the caller set
+        explicitly (cp -p, rsync, tar) before the close that flushes the
+        data; without it the flush stamped every copied file with its copy
+        time.  ``mode`` is the permission set for a new entry (the kernel's
+        umask-applied mode from create(2); every file used to land 0644,
+        which is what makes ssh refuse a key written into the vault) or an
+        explicit chmod deferred to this flush.
         """
         _validate_vpath(vpath)
         nonce, blob, chunk_count, sha256_hex = encrypt_file_data(
             data, self.final_key, self.metadata.get("chunk_size", VOLUME_CHUNK_SIZE)
         )
-        mtime = int(time.time())
+        if mtime is None:
+            mtime = int(time.time())
         # Preserve a mode an earlier chmod set: rebuilding the entry from
         # scratch made `chmod +x` then any write silently drop the bit.
         existing = self.dir_index.get(vpath)
-        mode = existing.get("mode", 0o100644) if existing else 0o100644
+        if mode is not None:
+            mode = stat.S_IFREG | (mode & 0o7777)
+        elif existing:
+            mode = existing.get("mode", 0o100644)
+        else:
+            mode = 0o100644
         nonce_b64 = base64.b64encode(nonce).decode()
 
         self.dir_index[vpath] = {
@@ -1398,7 +1569,7 @@ class VolumeContainer:
         self._dirty = True
 
     def set_attrs(self, vpath: str, *, mode: int | None = None,
-                  mtime: int | None = None) -> bool:
+                  mtime: float | None = None) -> bool:
         """Record a mode and/or mtime change so it survives unmount.
 
         Previously chmod/utimens mutated the entry in place and marked
@@ -1416,29 +1587,31 @@ class VolumeContainer:
             entry = self.dir_index.get(vpath)
         if entry is None:
             return False
-        record: dict[str, Any] = {"type": "setattr", "vpath": vpath}
+        op: dict[str, Any] = {"type": "setattr", "vpath": vpath}
         if mode is not None:
             mode = _typed_mode(entry, mode)
             entry["mode"] = mode
-            record["mode"] = mode
+            op["mode"] = mode
         if mtime is not None:
             entry["mtime"] = mtime
-            record["mtime"] = mtime
-        if len(record) == 2:      # nothing actually changed
+            op["mtime"] = mtime
+        if len(op) == 2:      # nothing actually changed
             return True
-        self._pending_ops.append(record)
+        self._pending_ops.append(op)
         self._dirty = True
         return True
 
-    def mkdir(self, vpath: str) -> None:
-        """Create a virtual directory."""
+    def mkdir(self, vpath: str, mode: int = 0o755) -> None:
+        """Create a virtual directory with the caller's (umask-applied)
+        permission bits — `mkdir -m 700` and gpg's homedir check depend on
+        them surviving."""
         if not vpath.endswith("/"):
             vpath += "/"
         _validate_vpath(vpath)
         if vpath in self.dir_index:
             return  # already exists
         mtime = int(time.time())
-        mode = 0o40755
+        mode = stat.S_IFDIR | (mode & 0o7777)
         self.dir_index[vpath] = {
             "type": "dir",
             "mode": mode,
@@ -1736,6 +1909,14 @@ class VolumeContainer:
                 current_owner[vp] = i
                 write_final_path[i] = vp
                 emit_pos[i] = i
+                # ...and any earlier setattr on it: the write record carries
+                # the mode (copied from the in-memory entry, which the
+                # setattr already updated) and its own mtime.  Left in
+                # setattr_owners, a later rename pinned the stale setattr
+                # *after* the re-keyed write, and replay reverted the mtime
+                # and mode the write had set — found by the journal fuzz.
+                for sidx in setattr_owners.pop(vp, []):
+                    dropped.add(sidx)
             elif t == "setattr":
                 setattr_owners.setdefault(op["vpath"], []).append(i)
             elif t == "rename":
@@ -1857,6 +2038,121 @@ class VolumeContainer:
         kept.reverse()
         return kept
 
+    def _check_still_ours(self) -> None:
+        """Refuse to write into a file that is no longer the one open() read.
+
+        Identity is the pinned descriptor, not the path.  A sync client
+        restoring a version, a backup copied over the vault, a `cp`/`>` that
+        overwrites it in place, or a rename/move all change what the path
+        holds while the reader keeps serving the opened bytes; a path-based
+        append would then acknowledge writes into a foreign file and lose or
+        corrupt both parties' data (review runs 19 F-202, 20 F-001/F-002/
+        F-201).  ESTALE names the condition; the FUSE layer flips the mount
+        read-only and, when the inode was orphaned, rescues it to a sidecar.
+
+        The checks, in order: a *removed* path with an orphaned inode vs a
+        *moved* one (the inode still has a name); a *replaced* inode; a
+        *shortened* file (longer is our own failed append, truncated on the
+        retry); and — the case inode+size cannot see — an *in-place
+        overwrite*, caught by re-reading the header through the pinned fd
+        and checking it still names this volume.
+        """
+        with self._reader_lock:
+            fd = self._reader_fd
+            if fd is None:
+                # No pin (a direct caller that close()d, or a fresh format-1
+                # container before its first read).  Pin now so the next
+                # write has an identity; we cannot vouch for this one.
+                try:
+                    self._reader_fd = os.open(self.path, os.O_RDONLY)
+                except OSError:
+                    pass
+                return
+            pinned = os.fstat(fd)
+            header = os.pread(fd, HEADER_SIZE, 0)
+        try:
+            st = os.stat(self.path)
+        except FileNotFoundError as exc:
+            if pinned.st_nlink >= 1:
+                # The inode still has a name — the container was renamed or
+                # moved while mounted; our records are safe in it, but this
+                # path can no longer be written.
+                raise OSError(errno.ESTALE,
+                              "Volume container moved or renamed beneath the mount") from exc
+            raise OSError(errno.ESTALE, "Volume container removed beneath the mount") from exc
+        if (pinned.st_dev, pinned.st_ino) != (st.st_dev, st.st_ino):
+            raise OSError(errno.ESTALE, "Volume container replaced beneath the mount")
+        if st.st_size < self._journal_end:
+            raise OSError(errno.ESTALE, "Volume container shortened beneath the mount")
+        # Same inode, long enough: an in-place overwrite (cp/O_TRUNC, `> file`)
+        # keeps the inode and can end >= _journal_end, so only the header
+        # tells us the bytes are no longer ours.  A residual older copy of the
+        # *same* volume that is also long enough is the documented format-work
+        # gap (length trailer + header-as-AAD).
+        vol_id = self.header.get("volume_id")
+        if (len(header) < _OFF_VOL_ID + 16
+                or header[_OFF_MAGIC:_OFF_MAGIC + 6] != VOLUME_MAGIC
+                or (vol_id is not None
+                    and header[_OFF_VOL_ID:_OFF_VOL_ID + 16] != vol_id)):
+            raise OSError(errno.ESTALE, "Volume container overwritten beneath the mount")
+
+    def rescue_if_orphaned(self) -> "str | None":
+        """If the pinned inode has lost its name — a foreign replace, remove
+        or overwrite unlinked what this mount opened — and this session
+        appended records, copy the inode to a ``<path>.stale-<stamp>``
+        sidecar so those records survive the unmount that frees the fd
+        (review run 20 F-002).  Idempotent; returns the sidecar path or None.
+
+        Not for the in-place-overwrite or shortened cases: there the inode
+        still has a name (or is truncated in place), so its bytes are the
+        foreign ones, not ours — nothing to rescue.
+        """
+        # Claim the sidecar name atomically: check _stale_sidecar, snapshot
+        # the fd, and reserve the O_EXCL file under one lock so a concurrent
+        # rescue on the same container sees the claim and returns it rather
+        # than creating a second file (review run 22 F-002).  The copy runs
+        # outside the lock.
+        with self._stale_lock:
+            if self._stale_sidecar is not None:
+                return self._stale_sidecar
+            with self._reader_lock:
+                fd = self._reader_fd
+            if fd is None or not self._appended_since_open:
+                return None
+            try:
+                st = os.fstat(fd)
+            except OSError:
+                return None
+            if st.st_nlink != 0:
+                return None
+            stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+            sidecar = f"{self.path}.stale-{stamp}"
+            try:
+                out = os.open(sidecar, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except OSError as exc:
+                logger.warning("Volume %s: could not preserve the orphaned "
+                               "container (%s)", self.path, exc)
+                return None
+            self._stale_sidecar = sidecar          # claimed; a concurrent caller now returns it
+        try:
+            with os.fdopen(out, "wb") as dst:
+                off, size = 0, st.st_size
+                while off < size:
+                    chunk = os.pread(fd, min(1 << 20, size - off), off)
+                    if not chunk:
+                        break
+                    dst.write(chunk)
+                    off += len(chunk)
+            logger.warning(
+                "Volume %s: the container was replaced beneath the mount; the "
+                "volume as this mount had it was preserved to %s",
+                self.path, sidecar)
+            return sidecar
+        except OSError as exc:
+            logger.warning("Volume %s: could not preserve the orphaned "
+                           "container (%s)", self.path, exc)
+            return None
+
     def _append_journal(self, ops: list[dict] | None = None) -> None:
         """Append pending ops as journal records at the valid journal end (v2).
 
@@ -1870,6 +2166,11 @@ class VolumeContainer:
         """
         if ops is None:
             ops = self._coalesce_pending_ops()
+        self._check_still_ours()
+        # Counted locally: a record written before ENOSPC/EIO is truncated
+        # away and re-emitted by the retry, and counting it twice brought
+        # the next full compaction forward (run 18 F-209).
+        written = 0
         with open(self.path, "r+b") as f:
             f.seek(self._journal_end)
             f.truncate()
@@ -1885,7 +2186,7 @@ class VolumeContainer:
                     if not body and op.get("chunk_count", 0) > 0:
                         continue
                 body_offset = _write_journal_record(f, self.final_key, op, body)
-                self._journal_records += 1
+                written += 1
                 if op["type"] == "write" and op["vpath"] in self.dir_index:
                     entry = self.dir_index[op["vpath"]]
                     # Journal-region body offset is absolute; store relative
@@ -1896,6 +2197,8 @@ class VolumeContainer:
             os.fsync(f.fileno())
             self._file_size = f.tell()
             self._journal_end = self._file_size
+        self._journal_records += written
+        self._appended_since_open = True
 
         self._pending_ops.clear()
         self._file_data.clear()
@@ -1925,6 +2228,7 @@ class VolumeContainer:
         Memory profile is O(largest file in _file_data) plus a 1 MB sliding
         window for streaming unmodified blobs from the current container.
         """
+        self._check_still_ours()
         # Pass 1: compute new offsets + lengths into FRESH entry dicts —
         # self.dir_index is not touched until the os.replace() commit point.
         # For modified files data_length comes from the pending blob; for
@@ -1957,11 +2261,16 @@ class VolumeContainer:
         # ``.tmp`` name opened with the umask made the first compaction
         # widen a 0600 container to 0644, and is a symlink target).  On
         # disk-full / I/O error the temp file is removed.
+        # The target, not the name: rename(2) onto a symlink replaces the
+        # link itself, leaving the real file — the one every other opener
+        # uses — at its pre-compaction state (review run 19 F-201).
+        target = os.path.realpath(self.path)
         fd, tmp_path = tempfile.mkstemp(
-            prefix=f".{os.path.basename(self.path)}.qc-compact-",
-            dir=os.path.dirname(os.path.abspath(self.path)) or None,
+            prefix=f".{os.path.basename(target)}.qc-compact-",
+            dir=os.path.dirname(target) or None,
         )
         os.close(fd)
+        new_fd = -1
         _COPY_CHUNK = 1 << 20  # 1 MB sliding window for unmodified blobs
         try:
             with open(tmp_path, "wb") as tmp_f:
@@ -2006,20 +2315,41 @@ class VolumeContainer:
             # The replacement inherits the container's own permission bits
             # (a user may have loosened or tightened them since creation).
             try:
-                os.chmod(tmp_path, stat.S_IMODE(os.stat(self.path).st_mode))
+                os.chmod(tmp_path, stat.S_IMODE(os.stat(target).st_mode))
             except OSError:
                 pass
+            # Pin the new inode *before* the commit so identity is never
+            # unpinned: a write between compact() and the next read used to
+            # find _reader_fd None and skip the inode check (review run 20
+            # F-001).  os.open on the temp follows the inode through rename.
+            new_fd = os.open(tmp_path, os.O_RDONLY)
+            # The commit point is inside the same guard: a replace refused
+            # by a Finder-locked (uchg) container, or a folder that allows
+            # mkstemp but not the rename, used to orphan a full-size copy.
+            os.replace(tmp_path, target)
         except BaseException:
+            if new_fd >= 0:
+                try:
+                    os.close(new_fd)
+                except OSError:
+                    pass
             try:
                 os.unlink(tmp_path)
             except OSError:
                 pass
             raise
 
-        os.replace(tmp_path, self.path)
-        _fsync_dir(self.path)
-        # The old inode is gone; blob reads must open the new one.
-        self.close()
+        _fsync_dir(target)
+        # Swap the pinned reader to the new inode; close the old one.  The
+        # old inode is gone from the tree, but the descriptor kept it alive.
+        with self._reader_lock:
+            old_fd, self._reader_fd = self._reader_fd, new_fd
+        if old_fd is not None:
+            try:
+                _os_close(old_fd)
+            except OSError:
+                pass
+        self._appended_since_open = True
 
         # ── Commit point ──  The new container is on disk; only now do we
         # swap the in-memory state over to describe it.  _file_data is

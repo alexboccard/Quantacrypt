@@ -167,6 +167,17 @@ struct EncryptView: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            // Links are never packed (they would point outside the archive);
+            // the one front end that stayed silent about it was this one.
+            if let skipped = result.skippedSymlinks, !skipped.isEmpty {
+                Label("\(skipped.count) linked item\(skipped.count == 1 ? " was" : "s were") not included — links are never packed: \(skipped.joined(separator: ", "))",
+                      systemImage: "link")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .lineLimit(4)
+                    .accessibilityLabel("\(skipped.count) linked items were not included")
+            }
             // The original is still sitting there in plain text. Saying so is
             // the difference between "I encrypted my file" and the truth.
             if let source = model.sourcePath {

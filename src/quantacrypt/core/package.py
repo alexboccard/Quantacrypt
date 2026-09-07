@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64 as _b64
 import json
 import os
+import stat
 import ctypes
 import struct
 import sys
@@ -168,48 +169,98 @@ def normalize_shares(shares: Iterable[str]) -> list[str]:
     return codes
 
 
+def _phrases_in_run(words: list[str]) -> list[str]:
+    """The share codes hidden in one run of BIP-39 words, in order.
+
+    Three passes, cheapest and safest first.  The 8-bit checksum false-
+    accepts 1 window in 256, and a false accept that overlaps a real phrase
+    would swallow it, so the passes that try one alignment per segment come
+    before the one that tries every alignment:
+      1. segments aligned to the END of the run (header + phrases);
+      2. segments aligned to the START (phrases + trailer prose);
+      3. only if neither found anything, every offset left to right
+         (header + phrases + trailer).
+    A false accept that survives produces a share shamir_recover / the HMAC
+    then reject."""
+    n = cc.MNEMONIC_WORDS_PER_SHARE
+    if len(words) < n:
+        return []
+
+    def decode(seg: list[str]) -> str | None:
+        try:
+            return cc.encode_share(cc.mnemonic_to_share(" ".join(seg)))
+        except Exception:
+            return None
+
+    # Each pass hands the part of the run it did not consume back to the
+    # same function: "share one / <phrase> / share two / <phrase>" — every
+    # word of it in the wordlist — used to keep only the last phrase.
+    tail: list[str] = []
+    end = len(words)
+    while end >= n and (code := decode(words[end - n:end])):
+        tail.append(code); end -= n
+    if tail:
+        tail.reverse()
+        return _phrases_in_run(words[:end]) + tail
+    head: list[str] = []
+    start = 0
+    while start + n <= len(words) and (code := decode(words[start:start + n])):
+        head.append(code); start += n
+    if head:
+        return head + _phrases_in_run(words[start:])
+    found: list[str] = []
+    i = 0
+    while i + n <= len(words):
+        code = decode(words[i:i + n])
+        if code:
+            found.append(code); i += n
+        else:
+            i += 1
+    return found
+
+
 def extract_share_codes(text: str) -> list[str]:
     """Find every share in free text (share files, pasted notes) as QCSHARE-
     codes, in order of appearance.  Tolerates headers and prose: QCSHARE-
-    lines are taken as-is; runs of BIP-39 words are gathered and converted
-    when a run reaches the 50-word share length.  Duplicates collapse.
-    Used by both UIs so "Load from file…" and "Paste all" agree."""
+    lines are taken as-is; runs of lines made only of BIP-39 words are
+    gathered and split into 50-word phrases by checksum (see
+    ``_phrases_in_run``), so two phrases separated by a single newline, or
+    wrapped 8 per line with no blank line between, are two shares.
+    Duplicates collapse.  Used by both UIs so "Load from file…" and "Paste
+    all" agree."""
     codes: list[str] = []
     seen: set[str] = set()
-    lines = [ln.strip() for ln in (text or "").splitlines()]
-    for ln in lines:
-        if ln.upper().startswith("QCSHARE-"):
-            try:
-                code = cc.encode_share(cc.decode_share(ln))
-            except Exception:
-                continue
-            if code not in seen:
-                seen.add(code); codes.append(code)
     try:
         wl_set = set(cc._load_wordlist())
     except Exception:  # wordlist unavailable — codes only
-        return codes
+        wl_set = set()
     block: list[str] = []
 
-    def _flush():
-        if len(block) == cc.MNEMONIC_WORDS_PER_SHARE:
-            try:
-                code = cc.encode_share(cc.mnemonic_to_share(" ".join(block)))
-            except Exception:
-                code = None
-            if code and code not in seen:
-                seen.add(code); codes.append(code)
+    def add(code: str) -> None:
+        if code not in seen:
+            seen.add(code); codes.append(code)
+
+    def flush() -> None:
+        if block and wl_set:
+            for code in _phrases_in_run(block):
+                add(code)
         block.clear()
 
-    for ln in lines:
+    for ln in (text or "").splitlines():
+        ln = ln.strip()
+        if ln.upper().startswith("QCSHARE-"):
+            flush()                      # a code ends any phrase run
+            try:
+                add(cc.encode_share(cc.decode_share(ln)))
+            except Exception:
+                continue
+            continue
         toks = ln.lower().split()
-        if toks and all(t in wl_set for t in toks):
+        if wl_set and toks and all(t in wl_set for t in toks):
             block.extend(toks)
-            if len(block) > cc.MNEMONIC_WORDS_PER_SHARE:
-                del block[:-cc.MNEMONIC_WORDS_PER_SHARE]
         else:
-            _flush()
-    _flush()
+            flush()
+    flush()
     return codes
 
 
@@ -265,7 +316,7 @@ def derive_final_key(meta: dict, *, password: str | None = None,
         sk = cc.aes_gcm_decrypt(argon_key, d64("kyber_sk_enc_nonce"), d64("kyber_sk_enc"))
         _check()
         _p("Decapsulating shared secret...")
-        kem_ss = cc.kyber_decaps(sk, d64("kyber_kem_ct"), kem)
+        kem_ss = _decaps_proven(sk, d64("kyber_kem_ct"), kem)
         final_key = cc.xor_bytes(argon_key, kem_ss)
         hmac_key = final_key
     else:
@@ -282,12 +333,39 @@ def derive_final_key(meta: dict, *, password: str | None = None,
         sk = cc.aes_gcm_decrypt(master_key, d64("kyber_sk_enc_nonce"), d64("kyber_sk_enc"))
         _check()
         _p("Decapsulating shared secret...")
-        kem_ss = cc.kyber_decaps(sk, d64("kyber_kem_ct"), kem)
+        kem_ss = _decaps_proven(sk, d64("kyber_kem_ct"), kem)
         final_key = cc.xor_bytes(master_key, kem_ss)
         hmac_key = master_key
     _check()
-    cc._verify_meta_hmac(hmac_key, meta)
+    try:
+        cc._verify_meta_hmac(hmac_key, meta)
+    except ValueError as exc:
+        # The envelope unsealed, so the password/shares are right.  A
+        # metadata HMAC that fails now means a field was edited after
+        # encryption — a version rolled back, the KEM name swapped — and
+        # reporting that as a wrong password (with the Caps-Lock advice and
+        # "no way to recover" copy) told the wrong story.
+        raise CorruptPayload(
+            "The password or shares are right, but this file's metadata was "
+            "tampered with or damaged after it was encrypted. It cannot be "
+            "opened; use another copy or a backup.") from exc
     return final_key, hmac_key
+
+
+def _decaps_proven(sk: bytes, kem_ct: bytes, kem: str) -> bytes:
+    """Decapsulate after the KEM private key has unsealed.
+
+    Unsealing ``kyber_sk_enc`` is the credential proof; a failure past it —
+    a ciphertext of the wrong length, the other KEM's name — is tampering
+    or damage, never a wrong password.
+    """
+    try:
+        return cc.kyber_decaps(sk, kem_ct, kem)
+    except Exception as exc:
+        raise CorruptPayload(
+            "The password or shares are right, but this file's key data was "
+            "tampered with or damaged after it was encrypted. It cannot be "
+            "opened; use another copy or a backup.") from exc
 
 
 def verify_first_chunk(qcx_path: str, meta: dict, final_key: bytes) -> None:
@@ -451,7 +529,7 @@ def folder_stats(folder: str) -> tuple[int, int]:
     for dirpath, _, filenames in os.walk(folder):
         for fn in filenames:
             full = os.path.join(dirpath, fn)
-            if os.path.islink(full):
+            if not _is_regular(full):
                 continue
             try:
                 total += os.path.getsize(full)
@@ -459,6 +537,19 @@ def folder_stats(folder: str) -> tuple[int, int]:
                 pass
             count += 1
     return count, total
+
+
+def _is_regular(path: str) -> bool:
+    """True for a plain file.  Symlinks are skipped for the reason given in
+    zip_folder; FIFOs and sockets because os.walk lists them as files and
+    opening a FIFO blocks until a writer appears — never — with the cancel
+    token never consulted, while a socket fails the whole encrypt with an
+    opaque errno.  Postgres and Redis sockets, Jupyter runtime dirs and
+    mkfifo pipes all live inside folders people archive."""
+    try:
+        return stat.S_ISREG(os.lstat(path).st_mode)
+    except OSError:
+        return False
 
 
 #: Members below this size are always deflated: the sample would be the whole
@@ -541,7 +632,7 @@ def zip_folder(folder: str, dst, progress_cb: Progress = None,
                 full = os.path.join(dirpath, fn)
                 if os.path.abspath(full) == dst_abs:
                     continue
-                if os.path.islink(full):
+                if not _is_regular(full):
                     skipped.append(os.path.relpath(full, folder))
                     continue
                 zf.write(full, os.path.relpath(full, parent),
@@ -552,8 +643,9 @@ def zip_folder(folder: str, dst, progress_cb: Progress = None,
                     progress_cb(f"Compressing folder… {int(pct * 100)}% ({done}/{total_files} files)")
     if skipped and progress_cb:
         progress_cb(
-            f"Skipped {len(skipped)} symlink{'' if len(skipped) == 1 else 's'}. "
-            "Links are not followed, so their targets stay out of the archive."
+            f"Skipped {len(skipped)} item{'' if len(skipped) == 1 else 's'} "
+            "(symbolic links and special files). Links are not followed, so "
+            "their targets stay out of the archive."
         )
     return skipped
 
@@ -701,6 +793,10 @@ def decrypt_qcx(path: str, output_dir: str, *, password: str | None = None,
                         "encryption. The password is right, but this copy can't "
                         "be restored. Try another copy or a backup.") from exc
                 raise
+            # Symmetric with the encrypt path: a power cut costs a re-decrypt
+            # rather than data, but the result is placed as complete.
+            f.flush()
+            os.fsync(f.fileno())
         name = safe_output_name(fname)
         out, renamed = _place_without_clobber(tmp, output_dir, name)
         _mark_quarantined(out)
@@ -713,7 +809,7 @@ def decrypt_qcx(path: str, output_dir: str, *, password: str | None = None,
     if ts:
         try:
             os.utime(out, (ts, ts))
-        except OSError:
+        except (OSError, OverflowError, ValueError, TypeError):
             pass
     return {
         "output": out,

@@ -106,6 +106,65 @@ def _register_open_document(root):
         pass
 
 
+def _register_quit(root, launcher=None):
+    """Route the Quit Apple event (app menu, Dock, ⌘Q) through the same
+    guard as the launcher's close button.
+
+    Tk Aqua evaluates ``::tk::mac::Quit`` when the command exists and plain
+    ``exit`` otherwise — which raises SystemExit into mainloop() with no
+    mounted-volume dialog, no unmount and no clipboard wipe (run 18 F-205).
+    Every open wizard is asked first through its ``can_quit()`` (run 19
+    F-001): freshly generated shares are the only way to open the file
+    just written.
+    """
+    def _quit():
+        from quantacrypt.ui.shared import ClipboardTimer
+        # The wizards first — their can_quit() is a pure predicate that
+        # changes no state, so no later veto can strand a job an earlier
+        # window already cancelled (review run 20 F-005).  A window that
+        # cannot answer — mid destroy — is not a veto.  The launcher is
+        # evaluated LAST: its can_quit() unmounts (and can veto if that
+        # fails), which must not run until every wizard has consented
+        # (review run 21 F-002).
+        wizards = [w for w in root.winfo_children() if w is not launcher]
+        for win in wizards:
+            guard = getattr(win, "can_quit", None)
+            if guard is None:
+                continue
+            try:
+                if not guard():
+                    return
+            except Exception:
+                continue
+        if launcher is not None:
+            try:
+                alive = launcher.winfo_exists()
+            except Exception:
+                alive = False
+            if alive:
+                try:
+                    if not launcher.can_quit():          # prompts + unmounts; may veto
+                        return
+                except Exception:
+                    pass
+        # Committed: run each wizard's deferred teardown, then wipe + destroy.
+        for win in wizards:
+            commit = getattr(win, "commit_quit", None)
+            if commit is not None:
+                try:
+                    commit()
+                except Exception:
+                    pass
+        ClipboardTimer.wipe_all()
+        root.destroy()
+
+    try:
+        root.createcommand("::tk::mac::Quit", _quit)
+    except Exception:
+        # Not on macOS or Tcl/Tk doesn't support it — no-op
+        pass
+
+
 def _make_root():
     """Create a single persistent hidden Tk root shared by all screens.
 
@@ -159,6 +218,7 @@ def main():
             self_payload = None
         if self_payload:
             DecryptorApp(root, payload=self_payload, qcx_path=exe)
+            _register_quit(root)
             root.mainloop()
             return
 
@@ -170,6 +230,7 @@ def main():
             if arg.lower().endswith(".qcv"):
                 from quantacrypt.ui.launcher import LauncherApp
                 launcher = LauncherApp(root)
+                _register_quit(root, launcher)
                 # Defer volume open until after mainloop starts.  Wrap in a
                 # try/except so that a failed import or constructor (e.g.
                 # missing fusepy) doesn't leave the launcher withdrawn with
@@ -208,12 +269,14 @@ def main():
                 root.destroy()
                 return
             DecryptorApp(root, payload=pkg, qcx_path=arg)
+            _register_quit(root)
             root.mainloop()
             return
 
     # Case 3: Launcher
     from quantacrypt.ui.launcher import LauncherApp
-    LauncherApp(root)
+    launcher = LauncherApp(root)
+    _register_quit(root, launcher)
     root.mainloop()
 
 

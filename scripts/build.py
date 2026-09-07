@@ -20,6 +20,7 @@ Usage:
 
 import io
 import os
+import re
 import plistlib
 import shutil
 import struct
@@ -205,7 +206,12 @@ def _patch_plist(app_path, icon_name, vol_icon_name=None):
     version = _read_version()
     plist["CFBundleIdentifier"] = BUNDLE_ID
     plist["CFBundleShortVersionString"] = version   # user-facing "1.0.0"
-    plist["CFBundleVersion"] = version               # build number
+    # Build number: up to three dot-separated integers, or LaunchServices
+    # cannot order duplicate app copies by it.  Same rule as
+    # scripts/stamp_version.py::_bundle_version for the native app; a
+    # pre-release tag ("1.5.0-beta") keeps only its numeric prefix.
+    m = re.match(r"\d+(?:\.\d+){0,2}", version)
+    plist["CFBundleVersion"] = m.group(0) if m else version
 
     # Declare that we handle .qcx and .qcv documents
     plist["CFBundleDocumentTypes"] = [

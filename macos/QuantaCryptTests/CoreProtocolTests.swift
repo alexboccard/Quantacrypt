@@ -227,4 +227,63 @@ final class CoreProtocolTests: XCTestCase {
         let i: InspectInfo = try inspect.decoded()
         XCTAssertEqual(i.protectionSummary, "Protected by a split key. Any 2 of the 3 shares unlock it.")
     }
+
+    /// `suspect_sidecar` names the file the helper saved the unreadable
+    /// journal tail to. It is null on a clean mount and absent from an older
+    /// helper; both must still decode, and a flagged mount must carry the
+    /// path so the alert can name it (F-003).
+    func testVolumeMountResultCarriesTheSuspectSidecar() throws {
+        let flagged: JSONValue = ["mount_point": "/Users/x/QuantaCrypt Volumes/v", "volume_path": "/Users/x/v.qcv",
+                                  "journal_suspicious": true,
+                                  "suspect_sidecar": "/Users/x/v.qcv.suspect-20260905T101500"]
+        let f: VolumeMountResult = try flagged.decoded()
+        XCTAssertTrue(f.journalSuspicious)
+        XCTAssertEqual(f.suspectSidecar, "/Users/x/v.qcv.suspect-20260905T101500")
+
+        let clean: JSONValue = ["mount_point": "/m", "volume_path": "/v.qcv", "journal_suspicious": false,
+                                "suspect_sidecar": .null]
+        XCTAssertNil(try clean.decoded(as: VolumeMountResult.self).suspectSidecar)
+
+        let older: JSONValue = ["mount_point": "/m", "volume_path": "/v.qcv", "journal_suspicious": false]
+        XCTAssertNil(try older.decoded(as: VolumeMountResult.self).suspectSidecar)
+    }
+
+    /// `read_only` says the helper served the drive `-o ro` because the
+    /// container or its folder refuses writes. An older helper never sends
+    /// it, and a missing flag must read as a writable mount, not as a
+    /// `protocol_error` in the middle of a mount.
+    func testVolumeMountResultDefaultsReadOnlyToFalse() throws {
+        let readOnly: JSONValue = ["mount_point": "/m", "volume_path": "/v.qcv", "journal_suspicious": false,
+                                   "suspect_sidecar": .null, "read_only": true]
+        XCTAssertTrue(try readOnly.decoded(as: VolumeMountResult.self).readOnly)
+
+        let writable: JSONValue = ["mount_point": "/m", "volume_path": "/v.qcv", "journal_suspicious": false,
+                                   "suspect_sidecar": .null, "read_only": false]
+        XCTAssertFalse(try writable.decoded(as: VolumeMountResult.self).readOnly)
+
+        let older: JSONValue = ["mount_point": "/m", "volume_path": "/v.qcv", "journal_suspicious": false]
+        XCTAssertFalse(try older.decoded(as: VolumeMountResult.self).readOnly)
+    }
+
+    /// `volume_list` entries carry `read_only` too. The value must come
+    /// through as sent, and its absence (an older helper) must decode as a
+    /// writable row while staying distinguishable from a reported false,
+    /// since only a reported value may overrule what the model remembers
+    /// from the mount result.
+    func testMountedVolumeDecodesReadOnly() throws {
+        let readOnly: JSONValue = ["mount_point": "/m", "volume_path": "/v.qcv", "stats": .null, "read_only": true]
+        let flagged: MountedVolume = try readOnly.decoded()
+        XCTAssertTrue(flagged.readOnly)
+        XCTAssertEqual(flagged.reportedReadOnly, true)
+
+        let writable: JSONValue = ["mount_point": "/m", "volume_path": "/v.qcv", "stats": .null, "read_only": false]
+        let plain: MountedVolume = try writable.decoded()
+        XCTAssertFalse(plain.readOnly)
+        XCTAssertEqual(plain.reportedReadOnly, false)
+
+        let older: JSONValue = ["mount_point": "/m", "volume_path": "/v.qcv", "stats": .null]
+        let unreported: MountedVolume = try older.decoded()
+        XCTAssertFalse(unreported.readOnly)
+        XCTAssertNil(unreported.reportedReadOnly)
+    }
 }

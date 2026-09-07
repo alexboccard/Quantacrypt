@@ -92,6 +92,26 @@ final class CoreTransportTests: XCTestCase {
         XCTAssertThrowsError(try framer.append(Data([0x41])))
     }
 
+    // MARK: stderr privacy (run 17 F-012 / run 18 F-003, F-101)
+
+    /// Public or private is decided per line by the helper's level prefix.
+    /// The helper prefixes every line of a traceback with its record's
+    /// level, so an ERROR traceback survives whole and an INFO one — the
+    /// path-bearing kind — stays private; a substring never decides.
+    func testStderrPublicityFollowsTheLevelPrefixLineByLine() {
+        let isPublic = ProcessTransport.isPublicStderrLine
+        XCTAssertTrue(isPublic("qc-core ERROR quantacrypt.core.fuse_ops: post-eject save failed: PermissionError: [Errno 13] Permission denied"))
+        XCTAssertTrue(isPublic("qc-core ERROR fuse:   File \"fuse_ops.py\", line 1, in flush"))
+        XCTAssertTrue(isPublic("qc-core CRITICAL quantacrypt.service: giving up"))
+        XCTAssertTrue(isPublic("qc-core: unmount failed: OSError: [Errno 16] Resource busy"))
+        XCTAssertTrue(isPublic("Traceback (most recent call last):"))
+        XCTAssertFalse(isPublic("qc-core INFO quantacrypt.core.fuse_ops: read-only flip at /Users/a/Taxes 2025.qcv"))
+        XCTAssertFalse(isPublic("qc-core INFO quantacrypt.core.fuse_ops: PermissionError: [Errno 13] Permission denied: '/Users/a/Taxes 2025.qcv'"))
+        XCTAssertFalse(isPublic("qc-core WARNING quantacrypt.core.fuse_ops: Error report.docx could not be read"))
+        XCTAssertFalse(isPublic("  File \"/app/fuse_ops.py\", line 1, in flush"))
+        XCTAssertFalse(isPublic("PermissionError: [Errno 13] Permission denied: '/v.qcv'"))
+    }
+
     func testTheStdoutLimitIsSixteenMebibytes() {
         XCTAssertEqual(LineFramer.maxLineBytes, 16 * 1024 * 1024)
         XCTAssertEqual(LineFramer().limit, LineFramer.maxLineBytes)

@@ -123,17 +123,21 @@ Deviations from the original proposal:
 
 - The journal starts implicitly at `_data_offset + _baseline_size` (computed
   from the decrypted directory) instead of being recorded as an explicit
-  offset field in the header. The 512-byte header is unchanged from v1;
-  only the `CFBundleVersion` field is bumped to 2. This keeps the header
-  layout stable across the two versions and avoids tying a header byte to
-  a derived value that could drift.
+  offset field in the header. The 512-byte header layout is unchanged from
+  v1; only its 4-byte format-version field (`_OFF_VERSION` in
+  `core/volume.py`) is bumped to 2. This keeps the header layout stable
+  across versions and avoids tying a header byte to a derived value that
+  could drift. Since 2026-09-05 `open()` also cross-checks that field
+  against the sealed `format_version` (review run 13, F-020).
 - Each journal record carries its own encrypted header + GCM tag; a
   truncated tail simply fails to decrypt and replay stops there. No
   separate per-record HMAC on top of GCM.
 - Compaction thresholds are implemented as `save()` heuristics rather
-  than a background task: if the existing-plus-pending journal would
-  exceed 30 % of the baseline, or exceed 1 MB against an empty baseline,
-  `save()` rolls into `compact()` synchronously.
+  than a background task. The original rule (journal > 30 % of the
+  baseline, or > 1 MB against an empty baseline) was replaced by the
+  dead-space rule in the 2026-09-04 addendum below (dead space > 30 % of
+  live + 8 MB, or > 10k records); `save()` still rolls into `compact()`
+  synchronously.
 - V1 containers upgrade on first save via a single compact pass; mixed
   v1-header + v2-journal containers never exist on disk.
 - `compact()` is a public method so future UI work can expose a

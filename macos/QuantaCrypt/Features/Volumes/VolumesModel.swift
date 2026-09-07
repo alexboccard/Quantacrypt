@@ -67,7 +67,11 @@ final class VolumesModel {
     /// stands in for it.
     var mountInspectError: CoreError?
     var mountPoint = ""
-    private var mountPointChosenByUser = false
+    /// The volume `mountPoint` was chosen for. The choice used to be a flag
+    /// that stuck to every later volume, so opening B after choosing a
+    /// folder for A landed on A's folder — "already mounted" while A was
+    /// up, "not empty" once Finder had written to it.
+    private var mountPointChosenFor: String?
     var mountCredential: MountCredential = .password
     var mountPassword = ""
     var mountShares: [ShareEntry] = [ShareEntry(), ShareEntry()]
@@ -77,7 +81,16 @@ final class VolumesModel {
     var mountError: CoreError?
     var mountStatus: String?
     var mountedNote: String?
-    var suspiciousVolume: MountedVolume?
+    /// Whether the volume `mountedNote` names came up read-only. The note's
+    /// "drag files in" hint is wrong for a drive that refuses every write.
+    var mountedReadOnly = false
+    /// A mount whose journal tail failed to verify, and the sidecar the
+    /// helper saved that tail to (nil from an older helper).
+    struct SuspiciousMount: Equatable {
+        let volume: MountedVolume
+        let suspectSidecar: String?
+    }
+    var suspiciousMount: SuspiciousMount?
 
     // Mounted list
     var mounted: [MountedVolume] = []
@@ -86,6 +99,17 @@ final class VolumesModel {
     /// noise; a run of them means what is on screen is fiction.
     private var listFailures = 0
     var listIsStale: Bool { listFailures >= 2 }
+    /// Mount points this app opened read-only, from the `volume_mount`
+    /// results it saw. Only a fallback: an entry that `volume_list` reports
+    /// `read_only` for takes the helper's word, and that word replaces what
+    /// the set said for the point. Without that, a mount whose result never
+    /// reached `finishMount` (cancelled while the helper finished anyway,
+    /// or given up on locally) left the set wrong for as long as the next
+    /// drive at that point stayed mounted. It is what the row shows only
+    /// when a helper older than the key lists the drive, since every poll
+    /// replaces `mounted` wholesale. Never pruned by a poll: a list snapshot
+    /// taken mid-mount would drop the point the result is about to add.
+    private var readOnlyMountPoints: Set<String> = []
     var unmountCandidate: MountedVolume?
     var unmounting: Set<String> = []
     var unmountError: CoreError?
@@ -289,7 +313,11 @@ final class VolumesModel {
         mountError = nil
         mountStatus = nil
         mountedNote = nil
-        if !mountPointChosenByUser { mountPoint = Self.defaultMountPoint(for: path) }
+        mountedReadOnly = false
+        if mountPointChosenFor != path {
+            mountPointChosenFor = nil
+            mountPoint = Self.defaultMountPoint(for: path)
+        }
         mountInfo = nil
         mountInspectError = nil
         mountInspecting = true
@@ -341,8 +369,14 @@ final class VolumesModel {
         guard let url = Panels.chooseFolder(message: "Choose an empty folder to mount the volume at.",
                                             prompt: "Mount Here",
                                             directory: URL(fileURLWithPath: Self.mountRoot)) else { return }
-        mountPoint = url.path
-        mountPointChosenByUser = true
+        useMountPoint(url.path)
+    }
+
+    /// Record `path` as the mount point for the volume on screen; the next
+    /// volume gets the default again.
+    func useMountPoint(_ path: String) {
+        mountPoint = path
+        mountPointChosenFor = mountPath
     }
 
     func loadMountSharesFromFiles() {
@@ -404,6 +438,7 @@ final class VolumesModel {
         mountError = nil
         mountStatus = nil
         mountedNote = nil
+        mountedReadOnly = false
         mountTask = Task { [core] in
             do {
                 let result: VolumeMountResult = try await core.perform(
@@ -474,13 +509,65 @@ final class VolumesModel {
         // the session. (`createVolume` clears it at the start of a new one.)
         if createResult?.path == path { createResult = nil }
         recents.add(path, kind: .mounted)
-        let volume = MountedVolume(mountPoint: result.mountPoint, volumePath: result.volumePath ?? path, stats: nil)
+        let volume = MountedVolume(mountPoint: result.mountPoint, volumePath: result.volumePath ?? path, stats: nil,
+                                   readOnly: result.readOnly)
+        if result.readOnly {
+            readOnlyMountPoints.insert(result.mountPoint)
+        } else {
+            readOnlyMountPoints.remove(result.mountPoint)
+        }
+        // A poll from an older helper may already have listed the new drive
+        // unflagged.
+        mounted = stampReadOnly(mounted)
         if result.journalSuspicious {
-            suspiciousVolume = volume
+            suspiciousMount = SuspiciousMount(volume: volume, suspectSidecar: result.suspectSidecar)
         } else {
             mountedNote = "Mounted \(volume.name) at \(Format.tildePath(result.mountPoint))."
+            mountedReadOnly = result.readOnly
         }
         Task { await refreshMounted() }
+    }
+
+    static let readOnlyMountMessage =
+        "Mounted read-only: the .qcv file or its folder can't be written. You can open and copy files out, but nothing can be saved onto the drive."
+
+    private func stampReadOnly(_ volumes: [MountedVolume]) -> [MountedVolume] {
+        volumes.map { volume in
+            var stamped = volume
+            stamped.readOnly = volume.reportedReadOnly ?? readOnlyMountPoints.contains(volume.mountPoint)
+            return stamped
+        }
+    }
+
+    /// Fold what a fresh `volume_list` reports into the fallback set, so a
+    /// later list from a helper that omits the key (or the stamp in
+    /// `finishMount`) cannot revive a flag the helper has already retracted.
+    private func reconcileReadOnly(with volumes: [MountedVolume]) {
+        for volume in volumes {
+            guard let reported = volume.reportedReadOnly else { continue }
+            if reported {
+                readOnlyMountPoints.insert(volume.mountPoint)
+            } else {
+                readOnlyMountPoints.remove(volume.mountPoint)
+            }
+        }
+    }
+
+    /// Body of the "may have been altered" alert.
+    ///
+    /// "Unmounting now keeps it untouched" was an unconditional promise
+    /// about a conditional guarantee: the container is safe only until
+    /// something writes, and macOS puts .DS_Store and Spotlight metadata on
+    /// a fresh mount within seconds — the first save then truncates the
+    /// suspicious tail for good. This matches the Tk wording, which tells
+    /// the user to keep a copy first. The sidecar is the one artefact an
+    /// investigation could use; left unnamed it is litter beside the volume.
+    static func suspiciousMountMessage(_ mount: SuspiciousMount) -> String {
+        var text = "\(mount.volume.name)'s records don't match what QuantaCrypt last wrote. It may have been altered or swapped for an older copy. It was mounted using the last state that checks out.\n\nIf you didn't expect this, unmount now and keep a copy of the .qcv file before writing anything: macOS writes to a new drive within seconds, and the first write destroys the records that raised this."
+        if let sidecar = mount.suspectSidecar {
+            text += "\n\nThe unreadable records were saved to \(Format.fileName(sidecar)) beside the volume. Keep it with your backup if you need to investigate."
+        }
+        return text
     }
 
     func cancelMount() {
@@ -501,7 +588,8 @@ final class VolumesModel {
             let list: VolumeListResult = try await withTimeout(Self.checkTimeout) {
                 try await core.perform(.volumeList)
             }
-            mounted = list.volumes.sorted { $0.mountPoint < $1.mountPoint }
+            reconcileReadOnly(with: list.volumes)
+            mounted = stampReadOnly(list.volumes).sorted { $0.mountPoint < $1.mountPoint }
             listFailures = 0
             listLoaded = true
         } catch {
@@ -540,12 +628,19 @@ final class VolumesModel {
             do {
                 _ = try await core.perform(.volumeUnmount(mountPoint: volume.mountPoint))
                 mountedNote = "Unmounted \(volume.name)."
+                mountedReadOnly = false
             } catch let error as CoreError {
-                unmountError = error.code == .busy || error.code == .io
-                    ? CoreError(code: error.code,
-                                message: "Something is still using \(volume.name). Close Finder windows or apps opened from it, then try again.",
-                                detail: error.detail)
-                    : error
+                if error.code == .invalidInput {
+                    // Already ejected between the poll and the click: the
+                    // refresh below drops the row; no error banner.
+                    mountedNote = "\(volume.name) was already unmounted."
+                } else {
+                    unmountError = error.code == .busy || error.code == .io
+                        ? CoreError(code: error.code,
+                                    message: "Something is still using \(volume.name). Close Finder windows or apps opened from it, then try again.",
+                                    detail: error.detail)
+                        : error
+                }
             } catch {
                 unmountError = CoreError(code: .internal, message: error.localizedDescription, detail: "\(error)")
             }

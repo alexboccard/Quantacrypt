@@ -486,7 +486,7 @@ def test_volume_create_mount_list_unmount(h, tmp_path, monkeypatch):
     import quantacrypt.core.fuse_ops as fo
     mounted = {}
 
-    def fake_mount(path, key, mp):
+    def fake_mount(path, key, mp, **kw):
         assert isinstance(key, bytes) and len(key) == cc.KEY_BYTES
         mounted[mp] = {"volume_path": path, "volume": _FakeVol(suspicious=(mp.endswith("sus")))}
         return _FakeFuse(mounted[mp]["volume"])
@@ -521,7 +521,8 @@ def test_volume_create_mount_list_unmount(h, tmp_path, monkeypatch):
     h.send("volume_mount", {"path": res["path"], "mount_point": mp, "password": "pw-testpad"}, rid="m")
     mres = h.result("m")
     assert mres == {"mount_point": mp, "volume_path": res["path"],
-                    "journal_suspicious": False, "suspect_sidecar": None}
+                    "journal_suspicious": False, "suspect_sidecar": None,
+                    "read_only": False}
     stages = [e["stage"] for e in h.events("m") if e["event"] == "progress"]
     assert stages[0] == "read" and "kdf" in stages and stages[-1] == "mount"
 
@@ -885,7 +886,7 @@ def test_encrypt_reports_the_symlinks_it_left_out(tmp_path):
     res = pkg.encrypt_to_qcx(str(d), str(tmp_path / "proj.qcx"), mode="password",
                              password="pw-testpad", progress=msgs.append)
     assert res["skipped_symlinks"] == ["creds-link"]
-    assert any("Skipped 1 symlink" in m for m in msgs)
+    assert any("Skipped 1 item" in m for m in msgs)
     # A plain file has nothing to report.
     plain = tmp_path / "f.txt"
     plain.write_bytes(b"data")
@@ -1186,9 +1187,6 @@ def test_dump_protocol_fixtures_for_swift(tmp_path, src_file, out_dir, monkeypat
     h.send("volume_inspect", {"path": vpath}, rid="vi")
     dump("volume_inspect", h.final("vi"))
 
-    h.send("volume_list", {}, rid="vl")
-    dump("volume_list", h.final("vl"))
-
     h.send("ping", rid="p")
     dump("ping", h.final("p"))
 
@@ -1204,7 +1202,7 @@ def test_dump_protocol_fixtures_for_swift(tmp_path, src_file, out_dir, monkeypat
     import quantacrypt.core.fuse_ops as fo
     mounted = {}
 
-    def fake_mount(vpath_, key, mp):
+    def fake_mount(vpath_, key, mp, **kw):
         mounted[mp] = {"volume_path": vpath_, "volume": _FakeVol()}
         return _FakeFuse(mounted[mp]["volume"])
 
@@ -1216,6 +1214,11 @@ def test_dump_protocol_fixtures_for_swift(tmp_path, src_file, out_dir, monkeypat
     h.send("volume_mount", {"path": vpath, "mount_point": mount_point,
                             "password": "correct horse"}, rid="vm")
     dump("volume_mount", h.final("vm"))
+
+    # Listed while mounted, so the Swift MountedVolume decoder meets a real
+    # entry (an empty list exercised nothing — review F-210).
+    h.send("volume_list", {}, rid="vl")
+    dump("volume_list", h.final("vl"))
 
     h.send("volume_unmount", {"mount_point": mount_point}, rid="vu")
     dump("volume_unmount", h.final("vu"))

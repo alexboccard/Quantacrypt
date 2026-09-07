@@ -457,10 +457,13 @@ class TestFileInfoCard:
 
     def test_format_size_accuracy(self):
         from quantacrypt.ui.shared import fmt_size
+        # Decimal units, as Finder and the native shell show them.
         assert fmt_size(0)    == "0 B"
-        assert fmt_size(1023) == "1,023 B"
-        assert fmt_size(1024) == "1.0 KB"
-        assert fmt_size(1048576) == "1.0 MB"
+        assert fmt_size(999)  == "999 B"
+        assert fmt_size(1000) == "1.0 KB"
+        assert fmt_size(1536) == "1.5 KB"
+        assert fmt_size(1_000_000) == "1.0 MB"
+        assert fmt_size(5_000_000_000) == "5.0 GB"
 
 
 
@@ -937,6 +940,72 @@ class TestShamirKClamp:
             assert app._k.get() == 3
             assert app._n.get() == 3
         finally:
+            app.destroy()
+
+    def test_emptied_split_fields_never_raise_past_the_freeze(self, tk_root, monkeypatch):
+        """Run 18 F-204: _start read the IntVars after _freeze(); an emptied
+        Entry made get() raise and left the window busy and unclosable."""
+        import inspect
+        from quantacrypt.ui.encryptor import EncryptorApp
+        app = _encryptor_app(tk_root, monkeypatch)
+        try:
+            app._n.set(""); app._k.set("")
+            assert app._kn() is None
+            app._mode.set("single")
+            assert app._validate_secret() == "Password cannot be empty"
+            app._reset()                                   # used to raise at the k/n read
+            app._n.set(5); app._k.set(3)
+            assert app._kn() == (5, 3)
+            src = inspect.getsource(EncryptorApp._start)
+            assert src.index("self._kn()") < src.index("self._busy=True")
+            assert "self._k.get()" not in src.split("self._busy=True", 1)[1]
+            # Run 19 F-002: the batch twin.
+            srcb = inspect.getsource(EncryptorApp._start_batch)
+            assert srcb.index("self._kn()") < srcb.index("self._busy = True")
+            assert "self._k.get()" not in srcb.split("self._busy = True", 1)[1]
+        finally:
+            app.destroy()
+
+    def test_batch_start_with_an_emptied_split_field_does_not_strand_the_wizard(self, tk_root, tmp_path, monkeypatch):
+        """Run 19 F-002: `_start_batch` read the IntVars after the freeze.
+        Behavioural, not a source-text pin: that is what let the twin through."""
+        from quantacrypt.ui import encryptor as enc
+        app = _encryptor_app(tk_root, monkeypatch)
+        spawned = []
+        class FakeThread:
+            def __init__(self, *a, **kw): spawned.append(kw.get("target"))
+            def start(self): pass
+        monkeypatch.setattr(enc.threading, "Thread", FakeThread)
+        monkeypatch.setattr(app, "_confirm_weak_password", lambda: True)
+        try:
+            src = tmp_path / "one.txt"; src.write_text("x")
+            app._batch_paths = [str(src)]                    # _build_batch_ui seeds the folder from it
+            app._src_type.set("batch"); app._build_batch_ui(); app._on_src_type()
+            app._batch_out_var.set(str(tmp_path))
+            app._mode.set("single"); app._pw1v.set("correct horse battery"); app._pw2v.set("correct horse battery")
+            app._k.set("")                                   # an emptied Entry
+            app._start()                                     # used to raise TclError after the freeze
+            assert spawned and app._busy is True and (app._result_n, app._result_k) == (0, 0)
+        finally:
+            app._busy = False
+            app.destroy()
+
+    def test_can_quit_mirrors_the_close_guard(self, tk_root, monkeypatch):
+        """Run 19 F-001: the Quit Apple event asks the wizard."""
+        from quantacrypt.ui import encryptor as enc
+        app = _encryptor_app(tk_root, monkeypatch)
+        try:
+            assert app.can_quit() is True
+            app._busy = True
+            assert app.can_quit() is False
+            app._busy = False
+            app._shares_pending = {"/x.qcx"}
+            monkeypatch.setattr(enc.messagebox, "askyesno", lambda *a, **k: False)
+            assert app.can_quit() is False
+            monkeypatch.setattr(enc.messagebox, "askyesno", lambda *a, **k: True)
+            assert app.can_quit() is True
+        finally:
+            app._busy = False; app._shares_pending = set()
             app.destroy()
 
     def test_do_clamp_bounds_n_and_k(self, tk_root, monkeypatch):
@@ -2186,3 +2255,68 @@ class TestPasswordStrengthBarStaleResults:
         obj._inflight = ("typed-fast", ev, holder)          # worker already finished
         assert obj.score_for("typed-fast") == 4
         assert obj._last[0] == "typed-fast"
+
+
+@requires_tkinter
+class TestDecryptorForgetsAFileThatFailedToLoad:
+    def test_a_bad_pick_after_a_good_one_disarms_decrypt(self, tk_root, tmp_path, monkeypatch, qcx_sample):
+        """Run 18 F-206: the card already showed the new name while Decrypt
+        still ran against the previous file."""
+        app, _qcx = _decryptor_app(tk_root, tmp_path, monkeypatch, qcx_sample)
+        try:
+            assert app._payload is not None
+            bad = tmp_path / "notes.txt"; bad.write_text("plain")
+            app._on_file(str(bad))
+            assert app._payload is None and app._qcx_path is None and app._meta is None
+            assert app._validate() == "Open a .qcx file first"
+            assert app.title() == "QuantaCrypt · Decrypt"
+            # Run 19 F-101: the screen must agree with the state.
+            from quantacrypt.ui.decryptor import FILE_PROMPT
+            assert app._file_card._line1.cget("text") == FILE_PROMPT
+            assert app._btn._enabled is False and app._verify_btn._enabled is False
+            assert not hasattr(app, "_pw") or not app._pw.winfo_exists()
+            assert app._out.get() == "" and "isn't a QuantaCrypt" in app._err.cget("text")
+        finally:
+            app.destroy()
+
+
+class TestSwitchShareFormatAsksOnce:
+    def test_declining_the_switch_shows_one_dialog(self, monkeypatch):
+        """Run 18 F-207: the revert fired the trace and asked a second time."""
+        import types
+        from quantacrypt.ui import decryptor as dec
+        asked = []
+        monkeypatch.setattr(dec, "confirm", lambda *a, **k: asked.append(1) and False)
+        obj = types.SimpleNamespace(_meta={"threshold": 2}, _mode_val="shamir",
+                                    _inputs=[], _entries=[types.SimpleNamespace(get=lambda: "apple")],
+                                    built=[])
+        obj._build_share_inputs = obj.built.append
+        class Mode:
+            value = "raw"
+            def get(self): return self.value
+            def set(self, v):
+                self.value = v
+                dec.DecryptorApp._rebuild_inputs(obj)     # the write trace
+        obj._imode = Mode()
+        dec.DecryptorApp._rebuild_inputs(obj)
+        assert asked == [1] and obj._imode.value == "mnemonic" and obj.built == []
+
+
+@requires_tkinter
+class TestDecryptorCanQuit:
+    def test_a_running_worker_refuses_and_typed_input_asks(self, tk_root, tmp_path, monkeypatch, qcx_sample):
+        from quantacrypt.ui import decryptor as dec
+        app, _qcx = _decryptor_app(tk_root, tmp_path, monkeypatch, qcx_sample)
+        try:
+            assert app.can_quit() is True
+            app._busy = True
+            assert app.can_quit() is False
+            app._busy = False
+            monkeypatch.setattr(app, "_has_typed_input", lambda: True)
+            monkeypatch.setattr(dec, "confirm", lambda *a, **k: False)
+            assert app.can_quit() is False
+            monkeypatch.setattr(dec, "confirm", lambda *a, **k: True)
+            assert app.can_quit() is True
+        finally:
+            app._busy = False
+            app.destroy()

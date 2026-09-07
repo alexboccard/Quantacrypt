@@ -721,6 +721,18 @@ class DecryptorApp(tk.Toplevel):
                 return
         self._close()
 
+    def can_quit(self) -> bool:
+        """The Quit Apple event's guard (``__main__._register_quit``).  A
+        running worker cannot be waited for from there: say so and refuse."""
+        if self._busy:
+            self._set_status("Decryption in progress. Cancel it (Esc) or let it finish, then quit.")
+            return False
+        return not self._has_typed_input() or confirm(
+            self, "Discard what you typed?",
+            "Your password or shares haven't been used yet. "
+            "Closing this window throws them away.",
+            yes="Discard", no="Keep editing", danger=True)
+
     def _close(self):
         if self._busy:
             # Never destroy the window under a running worker: Argon2id
@@ -921,6 +933,7 @@ class DecryptorApp(tk.Toplevel):
             self._load_payload(path)
             self.title(f"{os.path.basename(path)} — QuantaCrypt · Decrypt")
         except ValueError as e:
+            self._forget_file()
             msg = str(e)
             low = msg.lower()
             if "not a quantacrypt" in low:
@@ -932,7 +945,19 @@ class DecryptorApp(tk.Toplevel):
                 self._set_error("This .qcx file is damaged and can't be read.", msg)
         except Exception as e:
             # OS/IO errors — don't expose paths or internals
+            self._forget_file()
             self._set_error("Couldn't open that file.", friendly_error(e))
+
+    def _forget_file(self):
+        """A file that failed to load must not leave the previous one armed
+        behind a card that already shows the new name: Decrypt would run
+        against the old file with credentials typed for the one on screen
+        (run 18 F-206).  The whole screen goes back to "open a file" — the
+        card's tick, the action buttons, the credential row and the output
+        folder all belonged to the previous file (run 19 F-101)."""
+        self._qcx_path = None
+        self._reset()
+        self._btn.enable(False)
 
     def _load_payload(self, path=None):
         for w in self._info_wrap.winfo_children(): w.destroy()
@@ -1323,6 +1348,10 @@ class DecryptorApp(tk.Toplevel):
                          f"{'s' if len(codes) != 1 else ''} from {where}.")
 
     def _rebuild_inputs(self):
+        # The revert below writes _imode, which fires this trace again: the
+        # guard has to come before the dialog, or "Keep editing" asks twice
+        # (run 18 F-207).
+        if getattr(self, "_rebuilding", False): return
         if self._meta and self._mode_val == "shamir":
             has_data = (
                 any(inp.has_input() for inp in self._inputs)
@@ -1332,7 +1361,6 @@ class DecryptorApp(tk.Toplevel):
                 if not confirm(self, "Switch share format?",
                                "Switching the format clears every share you've entered so far.",
                                yes="Switch and clear", no="Keep editing", danger=True):
-                    if getattr(self, "_rebuilding", False): return
                     # Use try/finally so flag always gets reset, even on exception
                     try:
                         self._rebuilding = True
@@ -1341,7 +1369,6 @@ class DecryptorApp(tk.Toplevel):
                     finally:
                         self._rebuilding = False
                     return
-            if getattr(self, "_rebuilding", False): return
             self._build_share_inputs(self._meta["threshold"])
 
     def _browse_out(self):
@@ -1607,7 +1634,7 @@ class DecryptorApp(tk.Toplevel):
                 if not code: continue
                 try:
                     sd = cc.decode_share(code)
-                except ValueError as ex:
+                except (ValueError, TypeError) as ex:
                     raise ValueError(
                         f"Share {i} can't be read: the code may be incomplete or damaged. "
                         f"Paste the whole QCSHARE- line again."

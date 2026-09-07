@@ -13,6 +13,7 @@ import os
 import re
 import sys
 import threading
+import time
 import uuid
 from errno import EEXIST as errno_EEXIST
 from typing import Any, Callable, IO
@@ -20,7 +21,8 @@ from typing import Any, Callable, IO
 from quantacrypt import __version__
 from quantacrypt.core import crypto as cc
 from quantacrypt.core import package as pkg
-from quantacrypt.core.errors import InvalidInput, InvalidRequest, classify_error
+from quantacrypt.core.errors import (InvalidInput, InvalidRequest, classify_error,
+                                     safe_reason)
 
 log = logging.getLogger("quantacrypt.service")
 
@@ -267,8 +269,11 @@ class Service:
         """Block until every worker has finished (``None`` = no limit)."""
         with self._rlock:
             threads = [r.thread for r in self._reqs.values() if r.thread]
+        # One deadline for all of them: joining each with the full timeout
+        # could hold the process for N x timeout at EOF.
+        deadline = None if timeout is None else time.monotonic() + timeout
         for t in threads:
-            t.join(timeout)
+            t.join(None if deadline is None else max(0.0, deadline - time.monotonic()))
 
     def shutdown(self, *, exit_after: bool = True) -> list[str]:
         """Cancel running work, save and unmount every volume, then exit.
@@ -283,20 +288,46 @@ class Service:
             reqs = list(self._reqs.values())
         for r in reqs:
             r.cancelled.set()
+        # One deadline for every worker, and the client's SIGTERM escalation
+        # (ServiceStop on this thread) must not unwind past the unmount loop
+        # below — that loop is the point of shutting down.
+        deadline = time.monotonic() + JOIN_SECONDS
         for r in reqs:
             if r.thread and r.thread is not threading.current_thread():
-                r.thread.join(JOIN_SECONDS)
+                try:
+                    r.thread.join(max(0.0, deadline - time.monotonic()))
+                except BaseException as exc:  # noqa: BLE001
+                    print(f"qc-core: shutdown join interrupted: {exc!r}", file=sys.stderr)
+                    break
         failures: list[str] = []
         try:
-            from quantacrypt.core.fuse_ops import get_mounted_volumes, unmount_volume
-            for mp in list(get_mounted_volumes()):
-                try:
-                    unmount_volume(mp)
-                except Exception as exc:  # noqa: BLE001 — reported, not hidden
-                    failures.append(mp)
-                    print(f"qc-core: unmount {mp} failed: {exc}", file=sys.stderr)
-        except Exception:  # fusepy absent — nothing to unmount
-            pass
+            from quantacrypt.core.fuse_ops import (_mounted_volumes, get_mounted_volumes,
+                                                   unmount_volume)
+        except ImportError:  # fusepy absent — nothing to unmount
+            mounts = []
+        else:
+            try:
+                mounts = list(get_mounted_volumes())
+            except BaseException:  # noqa: BLE001 — the same escalation, earlier
+                mounts = list(_mounted_volumes)
+        for mp in mounts:
+            try:
+                unmount_volume(mp)
+            except Exception as exc:  # noqa: BLE001 — reported, not hidden
+                failures.append(mp)
+                # `qc-core: ` lines are public in the shell's log; the
+                # mount point is not.
+                print(f"qc-core: unmount failed: {safe_reason(exc)}", file=sys.stderr)
+                log.info("unmount of %s failed: %s", mp, exc)
+            except BaseException as exc:  # noqa: BLE001
+                # The client's SIGTERM escalation arrives as ServiceStop
+                # on this thread while one diskutil is wedged.  Letting it
+                # unwind abandoned every later volume (their dirty buffers
+                # with them) and the unmount_failed report; the loop has
+                # to finish and the stdin loop already knows to stop.
+                failures.append(mp)
+                print(f"qc-core: unmount interrupted: {exc!r}", file=sys.stderr)
+                log.info("unmount of %s interrupted", mp)
         if exit_after and self._exit_fn:
             self._exit_fn()
         return failures
@@ -370,7 +401,7 @@ def op_fuse_check(params: dict, ctx: _Ctx) -> dict:
 
 def op_inspect(params: dict, ctx: _Ctx) -> dict:
     _need(params, "path")
-    return pkg.inspect_summary(params["path"])
+    return pkg.inspect_summary(os.path.expanduser(params["path"]))
 
 
 def op_encrypt(params: dict, ctx: _Ctx) -> dict:
@@ -383,11 +414,12 @@ def op_encrypt(params: dict, ctx: _Ctx) -> dict:
         k, n = _int_pair(params)
     else:
         _need(params, "password")
+    _embed = _opt_str(params, "embed_binary")
     return pkg.encrypt_to_qcx(
-        params["source"], params["output"], mode=mode,
-        password=_opt_str(params, "password"), k=k, n=n,
+        os.path.expanduser(params["source"]), os.path.expanduser(params["output"]),
+        mode=mode, password=_opt_str(params, "password"), k=k, n=n,
         progress=ctx.progress, cancel_check=ctx.cancelled,
-        embed_binary=_opt_str(params, "embed_binary"))
+        embed_binary=os.path.expanduser(_embed) if _embed else None)
 
 
 def op_decrypt(params: dict, ctx: _Ctx) -> dict:
@@ -395,8 +427,10 @@ def op_decrypt(params: dict, ctx: _Ctx) -> dict:
     verify_only = bool(params.get("verify_only"))
     if not verify_only:
         _need(params, "output_dir")
+    _outdir = _opt_str(params, "output_dir") or ""
     return pkg.decrypt_qcx(
-        params["path"], _opt_str(params, "output_dir") or "",
+        os.path.expanduser(params["path"]),
+        os.path.expanduser(_outdir) if _outdir else "",
         password=_opt_str(params, "password"), shares=_opt_list(params, "shares"),
         verify_only=verify_only, progress=ctx.progress, cancel_check=ctx.cancelled)
 
@@ -406,9 +440,9 @@ def op_volume_inspect(params: dict, ctx: _Ctx) -> dict:
     client pick password vs split-key entry before asking."""
     from quantacrypt.core import volume as vol
     _need(params, "path")
-    path = params["path"]
+    path = os.path.expanduser(params["path"])
     header, auth = vol.read_volume_auth_params(path)
-    mode = auth.get("mode", "single")
+    mode = auth["mode"]          # required by _read_auth_params
     return {
         "path": path,
         "size": os.path.getsize(path),
@@ -424,7 +458,7 @@ def op_volume_inspect(params: dict, ctx: _Ctx) -> dict:
 def op_volume_create(params: dict, ctx: _Ctx) -> dict:
     from quantacrypt.core import volume as vol
     _need(params, "path", "mode")
-    path = params["path"]
+    path = os.path.expanduser(params["path"])
     if not path.lower().endswith(".qcv"):
         path += ".qcv"
     if os.path.exists(path):
@@ -458,13 +492,14 @@ def op_volume_mount(params: dict, ctx: _Ctx) -> dict:
     from quantacrypt.core import volume as vol
     from quantacrypt.core.fuse_ops import mount_volume
     _need(params, "path", "mount_point")
-    path, mp = params["path"], params["mount_point"]
+    # Both expanded: mount_volume realpath()s the container (which does not
+    # expand `~`), and the mount point must round-trip into volume_unmount
+    # and volume_list.  Every path param expands `~` (protocol doc).
+    path, mp = os.path.expanduser(params["path"]), os.path.expanduser(params["mount_point"])
     ctx.progress("Reading volume...")
     _header, auth = vol.read_volume_auth_params(path)
     ctx.check()
-    # A missing "mode" is a password volume, as op_volume_inspect and the
-    # Tk manager already assume.
-    if auth.get("mode", "single") == "single":
+    if auth["mode"] == "single":   # required by _read_auth_params
         _need(params, "password")
         ctx.progress("Deriving 512-bit password key (Argon2id)...")
         key = vol.derive_volume_key_single(params["password"], auth)
@@ -477,7 +512,7 @@ def op_volume_mount(params: dict, ctx: _Ctx) -> dict:
         key = vol.derive_volume_key_shamir(codes[:k], auth)
     ctx.check()
     ctx.progress("Mounting...")
-    fuse_obj = mount_volume(path, key, mp)
+    fuse_obj = mount_volume(path, key, mp, credential_proven=True)
     vc = getattr(fuse_obj, "volume", None)
     suspicious = bool(getattr(vc, "journal_suspicious", False))
     # Name the preserved tail to the caller. open() copies it to a sidecar
@@ -486,14 +521,18 @@ def op_volume_mount(params: dict, ctx: _Ctx) -> dict:
     # an unexplained file next to their vault and deletes it.
     sidecar = getattr(vc, "suspect_sidecar", None) if suspicious else None
     return {"mount_point": mp, "volume_path": path,
-            "journal_suspicious": suspicious, "suspect_sidecar": sidecar}
+            "journal_suspicious": suspicious, "suspect_sidecar": sidecar,
+            # The container or its folder refuses writes: the drive is
+            # served read-only and the UI should say so.
+            "read_only": bool(getattr(vc, "read_only", False))}
 
 
 def op_volume_unmount(params: dict, ctx: _Ctx) -> dict:
     from quantacrypt.core.fuse_ops import unmount_volume
     _need(params, "mount_point")
-    unmount_volume(params["mount_point"])
-    return {"mount_point": params["mount_point"]}
+    mp = os.path.expanduser(params["mount_point"])
+    unmount_volume(mp)
+    return {"mount_point": mp}
 
 
 def op_volume_list(params: dict, ctx: _Ctx) -> dict:
@@ -504,7 +543,11 @@ def op_volume_list(params: dict, ctx: _Ctx) -> dict:
         mounted = {}
     out = []
     for mp, info in mounted.items():
-        entry = {"mount_point": mp, "volume_path": info.get("volume_path")}
+        # read_only travels with every list entry, not only the mount result:
+        # the shell replaces its mounted list from this poll every few
+        # seconds, so a flag carried only by volume_mount would vanish.
+        entry = {"mount_point": mp, "volume_path": info.get("volume_path"),
+                 "read_only": bool(info.get("read_only", False))}
         vc = info.get("volume")
         try:
             entry["stats"] = vc.stat() if vc is not None else None
